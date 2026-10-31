@@ -39,7 +39,9 @@ On CPU, pass `--dtype bfloat16` unless you have well over 12.5 GB of free RAM. f
 
 For each task family: dedupe (keeps the earliest copy), a 70/15/15 time split, a logistic-regression head on
 train, a temperature fitted on calib, and on test: accuracy vs teacher, accuracy vs human labels (when
-present, next to the teacher's own accuracy vs human), and ECE before/after scaling.
+present, next to the teacher's own accuracy vs human), and ECE before/after scaling. With `--features d1`
+the report adds a `zero_shot` row: untrained d1's own answer on the same rows, recomputed from the same
+features (no extra forward pass). A student that doesn't beat it isn't worth training.
 
 Simulated logs from AG News for a quick end-to-end run: `python scripts/simulate_logs.py > logs.jsonl`.
 

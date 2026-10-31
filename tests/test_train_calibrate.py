@@ -47,6 +47,20 @@ def test_baseline_reports_accuracy_and_ece(write_jsonl):
     assert 0 <= t["ece_after"] <= 1 and 0 <= t["ece_before"] <= 1 and t["temperature"] > 0
 
 
+def test_baseline_adds_zero_shot_row_when_extractor_has_one(write_jsonl):
+    class WithZeroShot(HashingFeatures):
+        def zero_shot(self, X, question):  # a model that always says "billing", confidently
+            return np.log(np.tile([0.97, 0.02, 0.01], (len(X), 1)))
+
+    path = str(write_jsonl(make_logs(600)))
+    assert "zero_shot" not in run(path, HashingFeatures())["tasks"]["ticket_team"]
+    t = run(path, WithZeroShot())["tasks"]["ticket_team"]
+    zs = t["zero_shot"]
+    assert set(zs) == {"accuracy_vs_teacher", "accuracy_vs_human", "temperature", "ece_before", "ece_after"}
+    assert zs["accuracy_vs_teacher"] < 0.5 < t["accuracy_vs_teacher"]  # constant guess ≈ 1/3; the head learns
+    assert zs["ece_after"] < zs["ece_before"]  # scaling tames the overconfident constant
+
+
 def test_baseline_skips_task_without_enough_data(write_jsonl):
     rows = [{**r, "label": "billing"} for r in make_logs(20)]
     assert "skipped" in run(str(write_jsonl(rows)), HashingFeatures())["tasks"]["ticket_team"]
