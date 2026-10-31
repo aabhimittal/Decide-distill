@@ -8,6 +8,7 @@ dependencies = ["numpy>=1.26"]
 [project.optional-dependencies]
 # Frozen d1-3B features. The model card requires transformers>=5.14 and trust_remote_code.
 d1 = ["torch", "transformers>=5.14", "torchvision", "pillow"]
+lora = ["peft"]
 serve = ["fastapi", "uvicorn"]
 dev = ["pytest", "fastapi", "httpx"]
 
