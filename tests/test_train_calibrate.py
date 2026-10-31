@@ -29,6 +29,18 @@ def test_linear_head_learns_separable_classes():
     assert (LinearHead().fit(X, y, 3).logits(X).argmax(1) == y).mean() > 0.95
 
 
+def test_linear_head_prior_is_start_point_and_shrinkage_centre():
+    rng = np.random.default_rng(0)
+    X = rng.normal(2, 3, size=(300, 20))
+    prior = rng.normal(size=(20, 3))
+    y = rng.integers(3, size=300)  # labels unrelated to the prior
+    assert np.allclose(LinearHead(steps=0).fit(X, y, 3, prior).logits(X), X @ prior)
+    held = LinearHead(l2=1e3).fit(X, y, 3, prior).logits(X)
+    assert (held.argmax(1) == (X @ prior).argmax(1)).mean() > 0.95  # strong shrinkage: stays at the prior
+    Xs = rng.normal(size=(300, 20)) + 3 * np.eye(20)[y]  # separable labels the prior knows nothing about
+    assert (LinearHead().fit(Xs, y, 3, prior).logits(Xs).argmax(1) == y).mean() > 0.95  # evidence wins
+
+
 def test_hashing_features_are_deterministic():
     f = HashingFeatures(256)
     assert np.array_equal(f(["a b c", {"k": 1}]), f(["a b c", {"k": 1}]))
@@ -59,6 +71,21 @@ def test_baseline_adds_zero_shot_row_when_extractor_has_one(write_jsonl):
     assert set(zs) == {"accuracy_vs_teacher", "accuracy_vs_human", "temperature", "ece_before", "ece_after"}
     assert zs["accuracy_vs_teacher"] < 0.5 < t["accuracy_vs_teacher"]  # constant guess ≈ 1/3; the head learns
     assert zs["ece_after"] < zs["ece_before"]  # scaling tames the overconfident constant
+
+
+def test_baseline_uses_readout_prior_only_when_asked(write_jsonl):
+    class WithPrior(HashingFeatures):
+        calls = 0
+
+        def readout_weights(self, question):
+            WithPrior.calls += 1
+            return np.zeros((self.dim, 3))
+
+    path = str(write_jsonl(make_logs(600)))
+    run(path, WithPrior())
+    assert WithPrior.calls == 0
+    assert run(path, WithPrior(), use_prior=True)["tasks"]["ticket_team"]["accuracy_vs_teacher"] > 0.6
+    assert WithPrior.calls == 1
 
 
 def test_baseline_skips_task_without_enough_data(write_jsonl):

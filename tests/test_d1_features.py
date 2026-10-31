@@ -25,3 +25,6 @@ def test_d1_features_are_what_d1_decides_from():
     for state, p in zip(states, ours):
         theirs = f.model.system_one(state, {"q": QUESTION})["answers"]["q"]["probabilities"]
         assert np.allclose(p, list(theirs.values()), atol=0.02)
+
+    # The linear readout prior (primary option tokens) picks the same answers as max-pooled zero-shot.
+    assert ((X @ f.readout_weights(QUESTION)).argmax(1) == ours.argmax(1)).all()

@@ -62,6 +62,13 @@ class D1Features:
         m = S.max(1, keepdims=True)
         return S - m - np.log(np.exp(S - m).sum(1, keepdims=True))
 
+    def readout_weights(self, question) -> np.ndarray:
+        """(D, K) `lm_head` rows of each option's primary token: d1's readout as a linear head.
+        Not exactly zero_shot, which max-pools over token forms (`A`, ` A`); a linear map can't max-pool."""
+        groups = self.prompt.readout_ids(self.engine.tokenizer, self.as_question(question))
+        with self.torch.inference_mode():
+            return self.model.lm_head.weight[[g[0] for g in groups]].float().cpu().numpy().T
+
     def __call__(self, states, question) -> np.ndarray:
         q = self.as_question(question)
         lm = self.model.model.language_model
