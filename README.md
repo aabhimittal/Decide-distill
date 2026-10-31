@@ -44,9 +44,20 @@ the report adds a `zero_shot` row: untrained d1's own answer on the same rows, r
 features (no extra forward pass). A student that doesn't beat it isn't worth training.
 
 `--prior` starts the d1 head from d1's own readout (the `lm_head` rows of each option's token) and shrinks
-towards it instead of towards zero. With no training it reproduces zero-shot exactly. On AG News (600 logs)
-it gave the same test accuracy as the zero-init head and worse calibration (ECE after scaling 0.132 vs
-0.091), so it is off by default. It may help on tasks with few labels; that is not measured yet.
+towards it instead of towards zero. With no training it reproduces zero-shot exactly.
+
+The head's L2 strength is picked per task from a grid, by NLL after temperature scaling on the calibration
+slice; the test slice plays no part (`l2` and `calib_nll_by_l2` in the report). On AG News (600 logs, 90 test
+rows):
+
+| | chosen l2 | calib NLL | test acc vs human | test ECE after |
+|---|---|---|---|---|
+| d1 zero-shot | – | – | 0.822 | 0.086 |
+| head, zero init | 0.1 | 0.480 | 0.867 | 0.039 |
+| head, `--prior` | 1.0 | 0.493 | 0.911 | 0.050 |
+
+`--prior` stays off by default: calibration NLL slightly prefers zero init, and its 4-row test lead is
+inside the noise of 90 rows.
 
 Simulated logs from AG News for a quick end-to-end run: `python scripts/simulate_logs.py > logs.jsonl`.
 
