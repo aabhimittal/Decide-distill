@@ -44,9 +44,23 @@ class D1Features:
         dtype = dtype or (torch.float32 if device == "cpu" else torch.bfloat16)  # the card's recommendation
         self.model = AutoModel.from_pretrained(model_id, trust_remote_code=True, dtype=dtype).to(device).eval()
         self.engine = self.model.engine  # d1's SystemOne: its render() is the exact prompt d1 decides from
-        prompt = sys.modules[type(self.engine).__module__.rsplit(".", 1)[0] + ".prompt"]
-        self.as_question = prompt.as_question
+        self.prompt = sys.modules[type(self.engine).__module__.rsplit(".", 1)[0] + ".prompt"]
+        self.as_question = self.prompt.as_question
         self.device = device
+
+    def zero_shot(self, X: np.ndarray, question) -> np.ndarray:
+        """d1's own answer recomputed from our features, as option log-probs: `lm_head` at the answer slot,
+        max-pooled over each option's token forms (prompt.readout). Only the option rows of `lm_head` are
+        needed: the full-vocab log-softmax d1 takes first shifts every option by one constant."""
+        groups = self.prompt.readout_ids(self.engine.tokenizer, self.as_question(question))
+        ids = [i for g in groups for i in g]
+        with self.torch.inference_mode():
+            W = self.model.lm_head.weight[ids].float().cpu().numpy()
+        logits = np.asarray(X, dtype=np.float32) @ W.T
+        bounds = np.cumsum([0] + [len(g) for g in groups])
+        S = np.stack([logits[:, a:b].max(1) for a, b in zip(bounds, bounds[1:])], axis=1)
+        m = S.max(1, keepdims=True)
+        return S - m - np.log(np.exp(S - m).sum(1, keepdims=True))
 
     def __call__(self, states, question) -> np.ndarray:
         q = self.as_question(question)

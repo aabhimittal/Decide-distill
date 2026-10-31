@@ -20,11 +20,8 @@ def test_d1_features_are_what_d1_decides_from():
     X = f(states, QUESTION)
     assert X.shape == (2, 2048) and np.isfinite(X).all()
 
-    # lm_head over our features, read at the option tokens, must reproduce d1's own system_one answer.
-    engine = f.engine
-    prompt = __import__(type(engine).__module__.rsplit(".", 1)[0] + ".prompt", fromlist=["readout"])
-    for state, x in zip(states, X):
-        logits = f.model.lm_head(torch.tensor(x, dtype=f.model.lm_head.weight.dtype)).float()
-        ours = prompt.readout(engine.tokenizer, f.as_question(QUESTION), logits - torch.logsumexp(logits, -1))
+    # zero_shot over our features (lm_head option rows + readout) must reproduce d1's own system_one answer.
+    ours = np.exp(f.zero_shot(X, QUESTION))
+    for state, p in zip(states, ours):
         theirs = f.model.system_one(state, {"q": QUESTION})["answers"]["q"]["probabilities"]
-        assert np.allclose(ours, list(theirs.values()), atol=0.02)
+        assert np.allclose(p, list(theirs.values()), atol=0.02)

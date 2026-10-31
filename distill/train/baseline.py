@@ -37,25 +37,29 @@ def evaluate_task(rows: list[Decision], extract, fractions=(0.7, 0.15, 0.15)) ->
         return extract([d.state for d in part], rows[0].question), np.array([classes.index(d.label) for d in part])
 
     (Xtr, ytr), (Xc, yc), (Xte, yte) = xy(split.train), xy(split.calib), xy(split.test)
-    head = LinearHead().fit(Xtr, ytr, len(classes))
-    T = fit_temperature(head.logits(Xc), yc)
-    raw = softmax(head.logits(Xte))
-    cal = softmax(head.logits(Xte) / T)
-    pred = raw.argmax(1)  # temperature never changes the argmax
     humans = [d.human_label for d in split.test]
-    student_vs_human, n_human = _acc(pred, humans, classes)
-    teacher_vs_human, _ = _acc(np.array([classes.index(d.label) for d in split.test]), humans, classes)
-    return {
+
+    def scores(logits_calib, logits_test) -> dict:
+        T = fit_temperature(logits_calib, yc)
+        raw, cal = softmax(logits_test), softmax(logits_test / T)
+        pred = raw.argmax(1)  # temperature never changes the argmax
+        return {"accuracy_vs_teacher": float((pred == yte).mean()),
+                "accuracy_vs_human": _acc(pred, humans, classes)[0],
+                "temperature": T, "ece_before": ece(raw, yte), "ece_after": ece(cal, yte)}
+
+    head = LinearHead().fit(Xtr, ytr, len(classes))
+    teacher_vs_human, n_human = _acc(yte, humans, classes)
+    report = {
         "n": sizes,
         "classes": classes,
-        "accuracy_vs_teacher": float((pred == yte).mean()),
-        "accuracy_vs_human": student_vs_human,
+        **scores(head.logits(Xc), head.logits(Xte)),
         "teacher_accuracy_vs_human": teacher_vs_human,  # the ceiling the student is learning towards
         "n_human_labels": n_human,
-        "temperature": T,
-        "ece_before": ece(raw, yte),
-        "ece_after": ece(cal, yte),
     }
+    if hasattr(extract, "zero_shot"):  # the untrained model's own answer: the bar a student must clear
+        q = rows[0].question
+        report["zero_shot"] = scores(extract.zero_shot(Xc, q), extract.zero_shot(Xte, q))
+    return report
 
 
 def run(path: str, extract) -> dict:
