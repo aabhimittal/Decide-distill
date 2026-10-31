@@ -12,10 +12,12 @@ import sys
 
 import numpy as np
 
-from distill.calibrate.temperature import ece, fit_temperature, softmax
+from distill.calibrate.temperature import ece, fit_temperature, nll, softmax
 from distill.dataset.build import by_task, dedupe, time_split
 from distill.logs.ingest import Decision, options, read_jsonl
 from distill.train.linear_head import LinearHead
+
+L2_GRID = (1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0)
 
 
 def _acc(pred: np.ndarray, labels: list[str | None], classes: list[str]) -> tuple[float | None, int]:
@@ -48,12 +50,22 @@ def evaluate_task(rows: list[Decision], extract, fractions=(0.7, 0.15, 0.15), us
                 "temperature": T, "ece_before": ece(raw, yte), "ece_after": ece(cal, yte)}
 
     prior = extract.readout_weights(rows[0].question) if use_prior else None
-    head = LinearHead().fit(Xtr, ytr, len(classes), prior)
+    # l2 is chosen on calib by NLL after temperature scaling, so confidence scale (which T fixes anyway) doesn't
+    # decide it. Calib then also fits T: calib-side numbers are mildly optimistic, test stays untouched.
+    head, calib_nll = None, {}
+    for l2 in L2_GRID:
+        h = LinearHead(l2=l2).fit(Xtr, ytr, len(classes), prior)
+        Lc = h.logits(Xc)
+        calib_nll[l2] = nll(Lc, yc, fit_temperature(Lc, yc))
+        if head is None or calib_nll[l2] < calib_nll[head.l2]:
+            head = h
     teacher_vs_human, n_human = _acc(yte, humans, classes)
     report = {
         "n": sizes,
         "classes": classes,
         **scores(head.logits(Xc), head.logits(Xte)),
+        "l2": head.l2,
+        "calib_nll_by_l2": {f"{k:g}": v for k, v in calib_nll.items()},
         "teacher_accuracy_vs_human": teacher_vs_human,  # the ceiling the student is learning towards
         "n_human_labels": n_human,
     }
@@ -82,7 +94,7 @@ def main(argv=None) -> None:
     p.add_argument("--device")
     # fp32 (the card's CPU default) needs ~12.5 GB for d1-3B; use bfloat16 on smaller machines.
     p.add_argument("--dtype", choices=["float32", "bfloat16"])
-    # Off by default: on AG News it matched zero-init accuracy and calibrated worse (see README).
+    # Off by default: calibration NLL prefers zero init on AG News (see README).
     p.add_argument("--prior", action="store_true", help="start the d1 head from d1's readout and shrink towards it")
     args = p.parse_args(argv)
     if args.prior and args.features != "d1":

@@ -88,6 +88,18 @@ def test_baseline_uses_readout_prior_only_when_asked(write_jsonl):
     assert WithPrior.calls == 1
 
 
+def test_l2_is_chosen_on_calib_and_never_sees_test_labels(write_jsonl):
+    rows = make_logs(600)
+    t = run(str(write_jsonl(rows, "a.jsonl")), HashingFeatures())["tasks"]["ticket_team"]
+    assert f"{t['l2']:g}" == min(t["calib_nll_by_l2"], key=t["calib_nll_by_l2"].get)
+    # Rewrite every test-slice label (the newest 15%): the choice and the calib NLLs must not move.
+    names = ["billing", "technical", "fraud"]
+    flipped = rows[:510] + [{**r, "label": names[(names.index(r["label"]) + 1) % 3]} for r in rows[510:]]
+    t2 = run(str(write_jsonl(flipped, "b.jsonl")), HashingFeatures())["tasks"]["ticket_team"]
+    assert t2["l2"] == t["l2"] and t2["calib_nll_by_l2"] == t["calib_nll_by_l2"]
+    assert t2["accuracy_vs_teacher"] < t["accuracy_vs_teacher"]  # the flip did reach the test slice
+
+
 def test_baseline_skips_task_without_enough_data(write_jsonl):
     rows = [{**r, "label": "billing"} for r in make_logs(20)]
     assert "skipped" in run(str(write_jsonl(rows)), HashingFeatures())["tasks"]["ticket_team"]
