@@ -102,7 +102,61 @@ offline estimate.
   the teacher. Normalized entropy plus how under-represented the request's cluster (cosine k-means) is in
   training. Never use it for the shadow sample: agreement needs a random sample.
 
+- **Fallback agreement**: every fallback is teacher-labeled anyway, so the student's own guess vs the teacher's
+  answer there is a second agreement stream, against its own calib baseline (`rejected_agreement`). When the
+  gate rejects most traffic, it is most of the concept-drift signal.
+
 `scripts/simulate_drift.py` runs all of it on AG News; results are in the next section.
+
+## Results: simulated drift on AG News (`scripts/simulate_drift.py`, d1-3B, CPU bf16)
+
+Era A (training, 800 logs): science/tech is 5% of traffic. Teacher = gold label with 10% uniform noise. Calib
+picked the readout prior at l2=10: 0.917 vs human on the 120 test rows (zero-shot d1: 0.908).
+
+**M3: served gate vs offline estimate.** 300 fresh era-A rows through the gate loaded from disk:
+
+| at target 0.95 | offline (test slice) | served (fresh rows) |
+|---|---|---|
+| fallback rate | 0.967 | 0.960 |
+| agreement on accepted rows | 1.000 | 1.000 |
+| system accuracy vs human | 0.908 | 0.903 |
+
+**The gate's target is the knob that matters, and 0.95 is a poor choice here.** Test-slice curve:
+
+| target agreement | fallback | system acc vs human | cost / 1k decisions |
+|---|---|---|---|
+| 0.80 | 0.8% | 0.917 | $0.003 |
+| 0.85 | 10.8% | **0.958** | $0.043 |
+| 0.90 | 93.3% | 0.917 | $0.373 |
+| 0.95 (default) | 96.7% | 0.908 | $0.387 |
+
+A 10%-noise teacher caps how often anyone can agree with it, so high targets reject almost everything and
+hand rows to a teacher that is *less* accurate than the student. At 0.85 the gate sends only the student's
+shaky rows to the teacher and beats both (student 0.917, teacher ≈ 0.90). Pick the target from this curve on
+your own data. It is measured on 120 rows, and the 0.85 → 0.90 cliff (τ 0.61 → 0.88) shows how coarse that is.
+
+**M4: drift alarms** (rolling window 500; PSI alarm at 0.2; agreement alarms at baseline − 0.1):
+
+| stream | PSI | fallback agreement (baseline 0.798) | alarms |
+|---|---|---|---|
+| stable, fresh era-A rows | 0.018 | 0.837 | none |
+| surge: science/tech 55% | **0.856** | 0.652 | PSI, fallback agreement |
+| concept: teacher files business as world | 0.018 | **0.569** | fallback agreement only |
+
+Shadow agreement on accepted rows never had enough samples (8 and 12; it needs 30), because the gate accepted
+so little at target 0.95. Without the fallback stream, the concept drift would have gone unseen.
+
+**M4: active learning does not beat random here.** Retrained on era A + B surge labels, scored on 300
+held-out surge rows vs human:
+
+| budget | prioritize() | entropy only | random (mean of 5) | no new labels |
+|---|---|---|---|---|
+| 30 | 0.830 | 0.797 | 0.814 | 0.730 |
+| 60 | 0.833 | 0.833 | 0.840 | 0.730 |
+
+`prioritize()` does find the gap (90–93% of its picks are science/tech, against 56% of the pool), but the
+surge pool is already majority science/tech, so random labels fill the same gap. A scenario where the new
+region is a small share of the pool would test it properly; not run yet.
 
 ## How d1 features are extracted
 
