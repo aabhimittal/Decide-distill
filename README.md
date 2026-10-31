@@ -43,6 +43,11 @@ present, next to the teacher's own accuracy vs human), and ECE before/after scal
 the report adds a `zero_shot` row: untrained d1's own answer on the same rows, recomputed from the same
 features (no extra forward pass). A student that doesn't beat it isn't worth training.
 
+`--prior` starts the d1 head from d1's own readout (the `lm_head` rows of each option's token) and shrinks
+towards it instead of towards zero. With no training it reproduces zero-shot exactly. On AG News (600 logs)
+it gave the same test accuracy as the zero-init head and worse calibration (ECE after scaling 0.132 vs
+0.091), so it is off by default. It may help on tasks with few labels; that is not measured yet.
+
 Simulated logs from AG News for a quick end-to-end run: `python scripts/simulate_logs.py > logs.jsonl`.
 
 ## How d1 features are extracted
