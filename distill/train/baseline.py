@@ -74,11 +74,15 @@ def main(argv=None) -> None:
     p.add_argument("--features", choices=["d1", "hashing"], default="d1")
     p.add_argument("--model", default="LiquidAI/d1-3B")
     p.add_argument("--device")
+    # fp32 (the card's CPU default) needs ~12.5 GB for d1-3B; use bfloat16 on smaller machines.
+    p.add_argument("--dtype", choices=["float32", "bfloat16"])
     args = p.parse_args(argv)
     if args.features == "d1":
+        import torch
+
         from distill.train.features import D1Features
 
-        extract = D1Features(args.model, args.device)
+        extract = D1Features(args.model, args.device, args.dtype and getattr(torch, args.dtype))
     else:
         from distill.train.features import HashingFeatures
 

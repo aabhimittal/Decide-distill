@@ -34,6 +34,9 @@ python -m distill.train.baseline logs.jsonl --features d1       # frozen d1-3B f
 python -m distill.train.baseline logs.jsonl --features hashing  # model-free floor
 ```
 
+On CPU, pass `--dtype bfloat16` unless you have well over 12.5 GB of free RAM. fp32 d1-3B thrashed a
+15 GB machine (600 rows did not finish in an hour; bf16 took 5 minutes).
+
 For each task family: dedupe (keeps the earliest copy), a 70/15/15 time split, a logistic-regression head on
 train, a temperature fitted on calib, and on test: accuracy vs teacher, accuracy vs human labels (when
 present, next to the teacher's own accuracy vs human), and ECE before/after scaling.
