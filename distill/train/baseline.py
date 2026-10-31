@@ -15,6 +15,8 @@ import numpy as np
 from distill.calibrate.temperature import ece, fit_temperature, nll, softmax
 from distill.dataset.build import by_task, dedupe, time_split
 from distill.logs.ingest import Decision, options, read_jsonl
+from distill.serve.gate import choose_tau, gate_metrics
+from distill.serve.student import Student
 from distill.train.linear_head import LinearHead
 
 L2_GRID = (1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0)
@@ -28,7 +30,8 @@ def _acc(pred: np.ndarray, labels: list[str | None], classes: list[str]) -> tupl
     return float(np.mean([classes[pred[i]] == labels[i] for i in idx])), len(idx)
 
 
-def evaluate_task(rows: list[Decision], extract, fractions=(0.7, 0.15, 0.15), use_prior: bool = False) -> dict:
+def evaluate_task(rows: list[Decision], extract, fractions=(0.7, 0.15, 0.15), target_agreement: float = 0.95,
+                  save_dir=None) -> dict:
     classes = options(rows[0].question)
     split = time_split(rows, fractions)
     sizes = {"train": len(split.train), "calib": len(split.calib), "test": len(split.test)}
@@ -41,7 +44,7 @@ def evaluate_task(rows: list[Decision], extract, fractions=(0.7, 0.15, 0.15), us
     (Xtr, ytr), (Xc, yc), (Xte, yte) = xy(split.train), xy(split.calib), xy(split.test)
     humans = [d.human_label for d in split.test]
 
-    def scores(logits_calib, logits_test) -> dict:
+    def scores(logits_calib, logits_test) -> dict:  # reports on test; calib only fits T
         T = fit_temperature(logits_calib, yc)
         raw, cal = softmax(logits_test), softmax(logits_test / T)
         pred = raw.argmax(1)  # temperature never changes the argmax
@@ -49,41 +52,81 @@ def evaluate_task(rows: list[Decision], extract, fractions=(0.7, 0.15, 0.15), us
                 "accuracy_vs_human": _acc(pred, humans, classes)[0],
                 "temperature": T, "ece_before": ece(raw, yte), "ece_after": ece(cal, yte)}
 
-    prior = extract.readout_weights(rows[0].question) if use_prior else None
-    # l2 is chosen on calib by NLL after temperature scaling, so confidence scale (which T fixes anyway) doesn't
-    # decide it. Calib then also fits T: calib-side numbers are mildly optimistic, test stays untouched.
-    head, calib_nll = None, {}
-    for l2 in L2_GRID:
-        h = LinearHead(l2=l2).fit(Xtr, ytr, len(classes), prior)
-        Lc = h.logits(Xc)
-        calib_nll[l2] = nll(Lc, yc, fit_temperature(Lc, yc))
-        if head is None or calib_nll[l2] < calib_nll[head.l2]:
-            head = h
+    q = rows[0].question
+    prior = extract.readout_weights(q) if hasattr(extract, "readout_weights") else None
+    head, init, calib_nll = select_head(Xtr, ytr, Xc, yc, len(classes), prior)
+    Lc, Lt = head.logits(Xc), head.logits(Xte)
+    T = fit_temperature(Lc, yc)
+    Pc, Pt = softmax(Lc / T), softmax(Lt / T)
+
+    # Gate: τ from calib (a fourth use of that slice, after l2, init and T); the test block is the honest estimate.
+    tau = choose_tau(Pc.max(1), Pc.argmax(1) == yc, target_agreement)
+    costs = [d.cost_usd for d in rows if d.cost_usd is not None]
+    human_idx = np.array([classes.index(h) if h is not None else -1 for h in humans])
+    gate = {"target_agreement": target_agreement,
+            "calib": gate_metrics(Pc.max(1), Pc.argmax(1), yc, tau),
+            "test": gate_metrics(Pt.max(1), Pt.argmax(1), yte, tau, human_idx,
+                                 float(np.mean(costs)) if costs else None)}
+
     teacher_vs_human, n_human = _acc(yte, humans, classes)
     report = {
         "n": sizes,
         "classes": classes,
-        **scores(head.logits(Xc), head.logits(Xte)),
+        **scores(Lc, Lt),
+        "init": init,
         "l2": head.l2,
-        "calib_nll_by_l2": {f"{k:g}": v for k, v in calib_nll.items()},
+        "calib_nll": calib_nll,
         "teacher_accuracy_vs_human": teacher_vs_human,  # the ceiling the student is learning towards
         "n_human_labels": n_human,
+        "gate": gate,
     }
     if hasattr(extract, "zero_shot"):  # the untrained model's own answer: the bar a student must clear
-        q = rows[0].question
         report["zero_shot"] = scores(extract.zero_shot(Xc, q), extract.zero_shot(Xte, q))
+    if save_dir is not None:
+        ref = np.bincount(np.concatenate([Pc.argmax(1), Pt.argmax(1)]), minlength=len(classes))
+        Student(rows[0].task, q, classes, head, T, tau, ref.tolist(), gate["calib"]["accepted_agreement"],
+                {**getattr(extract, "meta", {}), "l2": head.l2, "init": init}).save(save_dir)
     return report
 
 
-def run(path: str, extract, use_prior: bool = False) -> dict:
+def select_head(Xtr, ytr, Xc, yc, n_classes: int, prior=None) -> tuple[LinearHead, str, dict]:
+    """The head with the lowest calib NLL after temperature scaling, over {zero, prior} × L2_GRID.
+
+    NLL after scaling, so confidence scale (which T fixes anyway) doesn't decide it. Calib also fits T later:
+    calib-side numbers are mildly optimistic, test stays untouched.
+    """
+    best, table = None, {}
+    for init, P in [("zero", None)] + ([("prior", prior)] if prior is not None else []):
+        for l2 in L2_GRID:
+            h = LinearHead(l2=l2).fit(Xtr, ytr, n_classes, P)
+            Lc = h.logits(Xc)
+            table[f"{init}/{l2:g}"] = v = nll(Lc, yc, fit_temperature(Lc, yc))
+            if best is None or v < best[2]:
+                best = (h, init, v)
+    return best[0], best[1], table
+
+
+def run(path: str, extract, target_agreement: float = 0.95, save_dir=None) -> dict:
     records, errors = read_jsonl(path)
     unique = dedupe(records)
     return {
         "ingest": {"records": len(records), "rejected": len(errors), "after_dedupe": len(unique),
                    "errors": errors[:20]},
-        "tasks": {task: evaluate_task(rows, extract, use_prior=use_prior)
+        "tasks": {task: evaluate_task(rows, extract, target_agreement=target_agreement, save_dir=save_dir)
                   for task, rows in sorted(by_task(unique).items())},
     }
+
+
+def make_extractor(features: str, model: str = "LiquidAI/d1-3B", device=None, dtype=None):
+    if features == "d1":
+        import torch
+
+        from distill.train.features import D1Features
+
+        return D1Features(model, device, dtype and getattr(torch, dtype))
+    from distill.train.features import HashingFeatures
+
+    return HashingFeatures()
 
 
 def main(argv=None) -> None:
@@ -94,22 +137,14 @@ def main(argv=None) -> None:
     p.add_argument("--device")
     # fp32 (the card's CPU default) needs ~12.5 GB for d1-3B; use bfloat16 on smaller machines.
     p.add_argument("--dtype", choices=["float32", "bfloat16"])
-    # Off by default: calibration NLL prefers zero init on AG News (see README).
-    p.add_argument("--prior", action="store_true", help="start the d1 head from d1's readout and shrink towards it")
+    p.add_argument("--target-agreement", type=float, default=0.95,
+                   help="gate: the student answers only where calib says it agrees with the teacher this often")
+    p.add_argument("--save", metavar="DIR", help="write one deployable student per task here")
     args = p.parse_args(argv)
-    if args.prior and args.features != "d1":
-        p.error("--prior needs --features d1")
-    if args.features == "d1":
-        import torch
-
-        from distill.train.features import D1Features
-
-        extract = D1Features(args.model, args.device, args.dtype and getattr(torch, args.dtype))
-    else:
-        from distill.train.features import HashingFeatures
-
-        extract = HashingFeatures()
-    json.dump(run(args.logs, extract, args.prior), sys.stdout, indent=2)
+    if not 0 < args.target_agreement <= 1:
+        p.error("--target-agreement must be in (0, 1]")
+    json.dump(run(args.logs, make_extractor(args.features, args.model, args.device, args.dtype),
+                  args.target_agreement, args.save), sys.stdout, indent=2)
     print()
 
 

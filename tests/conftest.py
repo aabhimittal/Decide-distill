@@ -17,14 +17,15 @@ VOCAB = {
 FILLER = ["please", "help", "my", "account", "today", "the", "app", "i", "was", "hello"]
 
 
-def make_logs(n=600, teacher_noise=0.1, seed=0):
-    """Simulated teacher logs: the human label is the truth, the teacher flips `teacher_noise` of them."""
+def make_logs(n=600, teacher_noise=0.1, seed=0, mix=None, start=0):
+    """Simulated teacher logs: the human label is the truth, the teacher flips `teacher_noise` of them.
+    `mix`: class probabilities (default uniform); `start`: first row index, for later traffic."""
     rng = np.random.default_rng(seed)
     t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
     names = list(VOCAB)
     rows = []
-    for i in range(n):
-        truth = names[rng.integers(3)]
+    for i in range(start, start + n):
+        truth = names[rng.choice(3, p=mix)]
         words = list(rng.choice(VOCAB[truth], 2)) + list(rng.choice(FILLER, 4)) + [f"ref{i}"]
         rng.shuffle(words)
         teacher = names[rng.integers(3)] if rng.random() < teacher_noise else truth

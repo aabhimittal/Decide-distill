@@ -2,15 +2,23 @@
 
 Turn your LLM decisions into a local decision model. See [SPEC.md](SPEC.md) for the full design.
 
-Status: **M0** (log schema, ingestion, dedupe, time split) and **M1** (linear head on frozen d1-3B
-features, temperature scaling, accuracy + ECE report). M2–M4 (LoRA, gated serving, active learning, drift)
-are not built yet.
+Status: **M0** (log schema, ingestion, dedupe, time split), **M1** (linear head on frozen d1-3B features,
+temperature scaling, accuracy + ECE), **M3** (confidence-gated serving with teacher fallback) and **M4**
+(drift alarms, active learning, simulated drift scenario). **M2** (LoRA) is not built yet.
+
+```
+logs.jsonl ─▶ baseline --save ─▶ students/ ─▶ serve.app (gate) ─▶ answer
+                    ▲                               │ conf < τ ─▶ teacher ─▶ queue.jsonl (log format)
+                    └───────── retrain on logs + queue ◀────────┘
+                                                    └ /monitor: PSI, shadow agreement, alarms
+```
 
 ## Install
 
 ```bash
-pip install -e ".[dev]"        # core: numpy only
+pip install -e ".[dev]"        # core: numpy only (+ pytest, fastapi, httpx for the tests)
 pip install -e ".[d1]"         # + torch, transformers>=5.14 for d1-3B features
+pip install -e ".[serve]"      # + fastapi, uvicorn for the HTTP gate
 ```
 
 ## Log format (JSONL, one teacher decision per line)
@@ -43,23 +51,58 @@ present, next to the teacher's own accuracy vs human), and ECE before/after scal
 the report adds a `zero_shot` row: untrained d1's own answer on the same rows, recomputed from the same
 features (no extra forward pass). A student that doesn't beat it isn't worth training.
 
-`--prior` starts the d1 head from d1's own readout (the `lm_head` rows of each option's token) and shrinks
-towards it instead of towards zero. With no training it reproduces zero-shot exactly.
+**Choosing the head.** The calibration slice picks the head from {zero init, d1 readout prior} × six L2
+strengths, by NLL after temperature scaling; the test slice plays no part (`init`, `l2`, `calib_nll` in the
+report). The prior starts the head at d1's `lm_head` rows for each option token and shrinks towards them, so
+with no training it reproduces zero-shot exactly; it is only on offer with d1 features. On AG News (600 logs,
+90 test rows):
 
-The head's L2 strength is picked per task from a grid, by NLL after temperature scaling on the calibration
-slice; the test slice plays no part (`l2` and `calib_nll_by_l2` in the report). On AG News (600 logs, 90 test
-rows):
-
-| | chosen l2 | calib NLL | test acc vs human | test ECE after |
+| | init / l2 | calib NLL | test acc vs human | test ECE after |
 |---|---|---|---|---|
 | d1 zero-shot | – | – | 0.822 | 0.086 |
-| head, zero init | 0.1 | 0.480 | 0.867 | 0.039 |
-| head, `--prior` | 1.0 | 0.493 | 0.911 | 0.050 |
+| **chosen**: zero init | 0.1 | **0.480** | 0.867 | 0.039 |
+| readout prior | 1.0 | 0.493 | 0.911 | 0.050 |
 
-`--prior` stays off by default: calibration NLL slightly prefers zero init, and its 4-row test lead is
-inside the noise of 90 rows.
+Calibration picks zero init. The prior's 4-row test lead is inside the noise of 90 rows, and overruling the
+calibration slice because of it would be picking on test.
+
+**Gate.** τ is chosen on calib as the threshold that accepts the most rows while those rows agree with the
+teacher at ≥ `--target-agreement` (default 0.95). `gate.calib` is that choice; `gate.test` is the honest
+estimate: fallback rate, agreement on accepted rows, agreement and human accuracy of the whole gated system,
+and cost per 1k decisions (teacher only vs gated, from the logs' `cost_usd`; the local student's cost isn't
+counted). `--save students/` writes one deployable student per task (head, T, τ, drift reference).
 
 Simulated logs from AG News for a quick end-to-end run: `python scripts/simulate_logs.py > logs.jsonl`.
+
+## Serve (M3)
+
+```bash
+python -m distill.serve.app --students students/ --teacher mypkg.llm:ask \
+    --queue queue.jsonl --pool pool.jsonl --shadow 0.05
+curl -s localhost:8000/decide -d '{"task": "ticket_team", "state": "I was charged twice"}'
+curl -s localhost:8000/monitor
+```
+
+`--teacher` is your existing LLM call as `ask(task, state, question) -> label`. Every teacher answer
+(fallbacks, and the random `--shadow` sample of student answers) is appended to `--queue` as a log row, so
+the next `baseline` run trains on it directly. A teacher answer outside the question's options is a 502 and
+is never queued.
+
+`python -m distill.serve.replay students/ new_logs.jsonl` sends logged rows through the same gate, one at a
+time, with the logged label as the teacher: the check that served fallback rate and agreement match the
+offline estimate.
+
+## Monitor and active learning (M4)
+
+- **PSI** over the student's predicted classes in a rolling window vs the pre-deployment reference; alarm
+  at > 0.2 once 100 predictions are in. Needs no labels, so it sees every request; it catches inputs moving.
+- **Shadow agreement**: the random shadow sample's agreement with the teacher; alarm below the offline
+  agreement − 0.1 once 30 shadow labels are in. It catches the right answer moving, which PSI can't see.
+- **Active learning** (`distill.monitor.active.prioritize`): which unlabeled requests (`--pool`) to send to
+  the teacher. Normalized entropy plus how under-represented the request's cluster (cosine k-means) is in
+  training. Never use it for the shadow sample: agreement needs a random sample.
+
+`scripts/simulate_drift.py` runs all of it on AG News; results are in the next section.
 
 ## How d1 features are extracted
 

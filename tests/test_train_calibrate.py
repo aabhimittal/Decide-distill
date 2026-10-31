@@ -1,6 +1,8 @@
+import zlib
+
 import numpy as np
 
-from conftest import make_logs
+from conftest import VOCAB, make_logs
 from distill.calibrate.temperature import ece, fit_temperature, softmax
 from distill.train.baseline import run
 from distill.train.features import HashingFeatures
@@ -73,30 +75,40 @@ def test_baseline_adds_zero_shot_row_when_extractor_has_one(write_jsonl):
     assert zs["ece_after"] < zs["ece_before"]  # scaling tames the overconfident constant
 
 
-def test_baseline_uses_readout_prior_only_when_asked(write_jsonl):
+def test_calibration_chooses_between_prior_and_zero_init(write_jsonl):
     class WithPrior(HashingFeatures):
-        calls = 0
+        def __init__(self, prior):
+            super().__init__()
+            self.prior = prior
 
         def readout_weights(self, question):
-            WithPrior.calls += 1
-            return np.zeros((self.dim, 3))
+            return self.prior
 
-    path = str(write_jsonl(make_logs(600)))
-    run(path, WithPrior())
-    assert WithPrior.calls == 0
-    assert run(path, WithPrior(), use_prior=True)["tasks"]["ticket_team"]["accuracy_vs_teacher"] > 0.6
-    assert WithPrior.calls == 1
+    dim = HashingFeatures().dim
+    good = np.zeros((dim, 3))  # a prior that already knows the rule: each class's keywords vote for it
+    for k, words in enumerate(VOCAB.values()):
+        for w in words:
+            good[zlib.crc32(w.encode()) % dim, k] = 30.0
+    noise = np.random.default_rng(0).normal(0, 30.0, (dim, 3))
+    path = str(write_jsonl(make_logs(600, teacher_noise=0.0)))
+
+    for prior, expected in [(good, "prior"), (noise, "zero")]:
+        t = run(path, WithPrior(prior))["tasks"]["ticket_team"]
+        assert t["init"] == expected
+        assert f"{t['init']}/{t['l2']:g}" == min(t["calib_nll"], key=t["calib_nll"].get)
+        assert len(t["calib_nll"]) == 12  # {zero, prior} × 6 strengths
+    assert len(run(path, HashingFeatures())["tasks"]["ticket_team"]["calib_nll"]) == 6  # no prior on offer
 
 
-def test_l2_is_chosen_on_calib_and_never_sees_test_labels(write_jsonl):
+def test_head_is_chosen_on_calib_and_never_sees_test_labels(write_jsonl):
     rows = make_logs(600)
     t = run(str(write_jsonl(rows, "a.jsonl")), HashingFeatures())["tasks"]["ticket_team"]
-    assert f"{t['l2']:g}" == min(t["calib_nll_by_l2"], key=t["calib_nll_by_l2"].get)
-    # Rewrite every test-slice label (the newest 15%): the choice and the calib NLLs must not move.
+    # Rewrite every test-slice label (the newest 15%): the choice, the calib NLLs and the gate must not move.
     names = ["billing", "technical", "fraud"]
     flipped = rows[:510] + [{**r, "label": names[(names.index(r["label"]) + 1) % 3]} for r in rows[510:]]
     t2 = run(str(write_jsonl(flipped, "b.jsonl")), HashingFeatures())["tasks"]["ticket_team"]
-    assert t2["l2"] == t["l2"] and t2["calib_nll_by_l2"] == t["calib_nll_by_l2"]
+    assert (t2["init"], t2["l2"], t2["calib_nll"]) == (t["init"], t["l2"], t["calib_nll"])
+    assert t2["gate"]["calib"] == t["gate"]["calib"]
     assert t2["accuracy_vs_teacher"] < t["accuracy_vs_teacher"]  # the flip did reach the test slice
 
 
