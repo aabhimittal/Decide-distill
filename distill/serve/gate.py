@@ -45,6 +45,8 @@ def gate_metrics(conf: np.ndarray, pred: np.ndarray, teacher: np.ndarray, tau: f
         "tau": tau,
         "fallback_rate": float(1 - accept.mean()),
         "accepted_agreement": float((pred[accept] == teacher[accept]).mean()) if accept.any() else None,
+        # the student's own guess vs the teacher on rows it handed over: the baseline the fallback monitor uses
+        "rejected_agreement": float((pred[~accept] == teacher[~accept]).mean()) if (~accept).any() else None,
         "system_agreement": float((answer == teacher).mean()),
     }
     if human is not None and (human >= 0).any():
@@ -68,10 +70,10 @@ class Gateway:
         self.students, self.extract, self.teacher = students, extract, teacher
         self.queue_path, self.pool_path = queue_path, pool_path
         self.shadow_rate, self.rng = shadow_rate, random.Random(seed)
+        floor = lambda expected: None if expected is None else expected - agreement_margin
         self.monitors = {
-            t: DriftMonitor(s.reference_counts, window,
-                            agreement_floor=None if s.expected_agreement is None
-                            else s.expected_agreement - agreement_margin)
+            t: DriftMonitor(s.reference_counts, window, agreement_floor=floor(s.expected_agreement),
+                            fallback_agreement_floor=floor(s.expected_fallback_agreement))
             for t, s in students.items()}
         self.counts = {t: {"requests": 0, "fallbacks": 0} for t in students}
         # shortcut: one lock serializes requests (file appends, monitors, the model); use a queue/worker for throughput.
@@ -90,6 +92,7 @@ class Gateway:
             if p[k] < s.tau:
                 self.counts[task]["fallbacks"] += 1
                 out.update(answer=self._ask(s, state, "fallback"), source="teacher")
+                self.monitors[task].observe_fallback(out["answer"] == s.classes[k])
                 return out
             if self.pool_path:
                 self._append(self.pool_path, {"task": task, "state": state,

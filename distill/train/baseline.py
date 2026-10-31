@@ -20,6 +20,7 @@ from distill.serve.student import Student
 from distill.train.linear_head import LinearHead
 
 L2_GRID = (1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0)
+GATE_CURVE = (0.8, 0.85, 0.9, 0.95, 0.99)
 
 
 def _acc(pred: np.ndarray, labels: list[str | None], classes: list[str]) -> tuple[float | None, int]:
@@ -63,10 +64,18 @@ def evaluate_task(rows: list[Decision], extract, fractions=(0.7, 0.15, 0.15), ta
     tau = choose_tau(Pc.max(1), Pc.argmax(1) == yc, target_agreement)
     costs = [d.cost_usd for d in rows if d.cost_usd is not None]
     human_idx = np.array([classes.index(h) if h is not None else -1 for h in humans])
+    cost = float(np.mean(costs)) if costs else None
+
+    def test_gate(t):
+        return gate_metrics(Pt.max(1), Pt.argmax(1), yte, t, human_idx, cost)
+
     gate = {"target_agreement": target_agreement,
             "calib": gate_metrics(Pc.max(1), Pc.argmax(1), yc, tau),
-            "test": gate_metrics(Pt.max(1), Pt.argmax(1), yte, tau, human_idx,
-                                 float(np.mean(costs)) if costs else None)}
+            "test": test_gate(tau),
+            # The target is a business choice, not a model parameter: show what each one buys on test. With a
+            # noisy teacher, high agreement targets fall back to it even where the student is more accurate.
+            "curve": [{"target": g, **test_gate(choose_tau(Pc.max(1), Pc.argmax(1) == yc, g))}
+                      for g in GATE_CURVE]}
 
     teacher_vs_human, n_human = _acc(yte, humans, classes)
     report = {
@@ -85,7 +94,8 @@ def evaluate_task(rows: list[Decision], extract, fractions=(0.7, 0.15, 0.15), ta
     if save_dir is not None:
         ref = np.bincount(np.concatenate([Pc.argmax(1), Pt.argmax(1)]), minlength=len(classes))
         Student(rows[0].task, q, classes, head, T, tau, ref.tolist(), gate["calib"]["accepted_agreement"],
-                {**getattr(extract, "meta", {}), "l2": head.l2, "init": init}).save(save_dir)
+                {**getattr(extract, "meta", {}), "l2": head.l2, "init": init},
+                gate["calib"]["rejected_agreement"]).save(save_dir)
     return report
 
 

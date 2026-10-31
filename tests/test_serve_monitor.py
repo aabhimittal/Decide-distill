@@ -162,6 +162,27 @@ def test_drift_scenario_psi_and_agreement_alarms(students):
     shifted = stream(stable, lambda task, state, q: relabel[state])
     assert not shifted["psi_alarm"] and shifted["agreement_alarm"]
     assert s.expected_agreement is not None
+    # Clean traffic must not trip either agreement alarm.
+    clean = stream(stable, labels_of(stable))
+    assert not clean["agreement_alarm"] and not clean["fallback_agreement_alarm"]
+
+
+def test_concept_drift_is_caught_on_fallbacks_when_the_gate_rejects_most_traffic(students):
+    """The d1 run's blind spot: with ~96% fallback, shadow checks of accepted rows are too few. Fallbacks are
+    teacher-labeled anyway; the student's guess vs the teacher there is the signal, against its own baseline."""
+    students, _ = students
+    s = students["ticket_team"]
+    s.tau = math.inf  # reject everything: no shadow samples at all
+    stable = make_logs(300, start=3000, seed=4)
+    s.expected_fallback_agreement = float(np.mean(
+        [s.classes[int(p.argmax())] == r["label"] for p, r in zip(s.probs(HashingFeatures()([r["state"] for r in stable])), stable)]))
+    relabel = {r["state"]: ("fraud" if r["label"] == "billing" else r["label"]) for r in stable}
+    for teacher, alarm in [(labels_of(stable), False), (lambda task, state, q: relabel[state], True)]:
+        gw = Gateway(students, HashingFeatures(), teacher, shadow_rate=1.0)
+        for r in stable:
+            gw.decide("ticket_team", r["state"])
+        st = gw.status()["ticket_team"]
+        assert st["n_shadow"] == 0 and st["n_fallback"] == 300 and st["fallback_agreement_alarm"] is alarm
 
 
 def test_active_learning_prefers_regions_training_never_saw():
