@@ -23,6 +23,7 @@ import numpy as np
 class HashingFeatures:
     def __init__(self, dim: int = 4096):
         self.dim = dim
+        self.meta = {"features": "hashing", "dim": dim}
 
     def __call__(self, states, question=None) -> np.ndarray:
         X = np.zeros((len(states), self.dim), dtype=np.float32)
@@ -47,6 +48,8 @@ class D1Features:
         self.prompt = sys.modules[type(self.engine).__module__.rsplit(".", 1)[0] + ".prompt"]
         self.as_question = self.prompt.as_question
         self.device = device
+        # A student trained on these features must be served with the same model and dtype.
+        self.meta = {"features": "d1", "model_id": model_id, "dtype": str(dtype).removeprefix("torch.")}
 
     def zero_shot(self, X: np.ndarray, question) -> np.ndarray:
         """d1's own answer recomputed from our features, as option log-probs: `lm_head` at the answer slot,
