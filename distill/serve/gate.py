@@ -8,6 +8,7 @@ Queue rows are decision-log rows (distill.logs.ingest), so the next training run
 
 from __future__ import annotations
 
+import importlib
 import json
 import math
 import random
@@ -58,6 +59,13 @@ def gate_metrics(conf: np.ndarray, pred: np.ndarray, teacher: np.ndarray, tau: f
     return out
 
 
+def load_teacher(spec: str):
+    module, _, name = spec.partition(":")
+    if not name:
+        raise ValueError(f"--teacher must look like package.module:function, got {spec!r}")
+    return getattr(importlib.import_module(module), name)
+
+
 class Gateway:
     def __init__(self, students: dict[str, Student], extract, teacher: Teacher,
                  queue_path: str | Path | None = None, pool_path: str | Path | None = None,
@@ -75,7 +83,7 @@ class Gateway:
             t: DriftMonitor(s.reference_counts, window, agreement_floor=floor(s.expected_agreement),
                             fallback_agreement_floor=floor(s.expected_fallback_agreement))
             for t, s in students.items()}
-        self.counts = {t: {"requests": 0, "fallbacks": 0} for t in students}
+        self.counts = {t: {"requests": 0, "fallbacks": 0, "teacher_calls": 0} for t in students}
         # shortcut: one lock serializes requests (file appends, monitors, the model); use a queue/worker for throughput.
         self.lock = threading.Lock()
 
@@ -102,9 +110,19 @@ class Gateway:
             return out
 
     def status(self) -> dict:
-        return {t: {**self.counts[t], **self.monitors[t].status()} for t in self.students}
+        return {t: {**self.counts[t], **self._cost(t), **self.monitors[t].status()} for t in self.students}
+
+    def _cost(self, task: str) -> dict:
+        """Live cost per 1k decisions: every teacher call (fallbacks and shadow checks) at the training logs'
+        mean cost, vs sending everything to the teacher. The local student's own cost isn't counted."""
+        c, unit = self.counts[task], self.students[task].meta.get("teacher_cost_usd")
+        if unit is None or not c["requests"]:
+            return {"cost_per_1k_teacher_only": None, "cost_per_1k_observed": None}
+        return {"cost_per_1k_teacher_only": 1000 * unit,
+                "cost_per_1k_observed": 1000 * unit * c["teacher_calls"] / c["requests"]}
 
     def _ask(self, s: Student, state: Any, reason: str) -> str:
+        self.counts[s.task]["teacher_calls"] += 1  # counted before validation: a bad answer is still paid for
         label = str(self.teacher(s.task, state, s.question))
         if label not in s.classes:  # never write a label the dataset builder would reject
             raise ValueError(f"teacher answered {label!r}, not one of {s.classes}")

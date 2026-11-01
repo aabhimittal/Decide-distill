@@ -37,6 +37,11 @@ def make_logs(n=600, teacher_noise=0.1, seed=0, mix=None, start=0):
     return rows
 
 
+def always_billing(task, state, question):
+    """A teacher for CLI tests, importable as conftest:always_billing."""
+    return "billing"
+
+
 @pytest.fixture
 def write_jsonl(tmp_path):
     def write(rows, name="logs.jsonl"):
