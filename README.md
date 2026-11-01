@@ -4,7 +4,8 @@ Turn your LLM decisions into a local decision model. See [SPEC.md](SPEC.md) for 
 
 Status: **M0** (log schema, ingestion, dedupe, time split), **M1** (linear head on frozen d1-3B features,
 temperature scaling, accuracy + ECE), **M3** (confidence-gated serving with teacher fallback) and **M4**
-(drift alarms, active learning, simulated drift scenario). **M2** (LoRA) is not built yet.
+(drift alarms, active learning, simulated drift scenario) and **M2** (LoRA fine-tune, compared with the linear
+head: on AG News it doesn't clearly beat it; see below). LoRA students are evaluated, not yet served.
 
 ```
 logs.jsonl ─▶ baseline --save ─▶ students/ ─▶ serve.app (gate) ─▶ answer
@@ -157,6 +158,32 @@ held-out surge rows vs human:
 `prioritize()` does find the gap (90–93% of its picks are science/tech, against 56% of the pool), but the
 surge pool is already majority science/tech, so random labels fill the same gap. A scenario where the new
 region is a small share of the pool would test it properly; not run yet.
+
+## LoRA fine-tune (M2)
+
+```bash
+pip install -e ".[d1,lora]"
+python -m distill.train.lora logs.jsonl --dtype bfloat16 --epochs 2 [--task NAME] > lora_report.json
+```
+
+LoRA (r=8 on the attention and short-conv projections; adapters kept in fp32 on the bf16 base, since bf16's
+~3 significant digits would swallow Adam's small updates) trains d1's own decision: cross-entropy over the
+max-pooled option logits at the answer slot, as `system_one` reads them. The epoch is chosen on calib NLL
+after temperature scaling, with untrained d1 (epoch 0) as a candidate, so harmful fine-tuning is not kept.
+The report puts the frozen-feature linear head (the full baseline report) next to LoRA on the same split.
+
+**Result, same 600 AG News logs and 90 test rows as above, CPU bf16 (about 2.5–5 s a row, 25 min an epoch):**
+
+| | calib NLL (selection metric) | test acc vs human | test ECE after scaling |
+|---|---|---|---|
+| d1 zero-shot (epoch 0) | 0.608 | 0.822 | 0.086 |
+| linear head, frozen features | **0.480** | 0.867 | **0.039** |
+| LoRA, epoch 1 (epoch 2 overfit: 0.547) | 0.522 | 0.900 | 0.084 |
+
+**LoRA does not clearly beat the linear head here.** Calibration prefers the head; LoRA's test lead is 3 rows of
+90, inside the noise; it calibrates worse after scaling (SPEC §10's risk, measured); and it costs minutes of
+compute to the head's seconds. AG News is a task d1 already reads well, which favours the cheap head. A task
+whose labels d1 doesn't already understand is where LoRA should earn its cost; that is not tested yet.
 
 ## How d1 features are extracted
 
