@@ -28,12 +28,36 @@ def labels_of(rows):
     return lambda task, state, question: by_state[state]
 
 
-def test_default_gate_target_is_085_and_the_curve_marks_it(trained):
+def test_default_gate_target_is_chosen_on_calib_human_labels(trained):
     _, _, t = trained
-    assert DEFAULT_TARGET == 0.85 and t["gate"]["target_agreement"] == 0.85
-    text = format_curve("ticket_team", t["gate"])
-    marked = [line for line in text.splitlines() if line.startswith(" *")]
+    assert DEFAULT_TARGET == "auto" and t["gate"]["target_agreement"] == "auto"
+    assert "system_accuracy_vs_human" in t["gate"]["calib"]  # the quantity it optimised, reported
+    assert format_curve("ticket_team", t["gate"]).splitlines()[0].startswith("[ticket_team] gate on test: target auto")
+
+
+def test_auto_target_falls_back_to_085_agreement_without_human_labels(write_jsonl):
+    rows = [{k: v for k, v in r.items() if k != "human_label"} for r in make_logs(600)]
+    t = run(str(write_jsonl(rows)), HashingFeatures())["tasks"]["ticket_team"]
+    assert t["gate"]["target_agreement"] == 0.85
+    marked = [line for line in format_curve("x", t["gate"]).splitlines() if line.startswith(" *")]
     assert len(marked) == 1 and marked[0].split()[1] == "0.85"
+
+
+def test_choose_tau_vs_human_takes_the_most_coverage_within_one_standard_error():
+    from distill.serve.gate import choose_tau_vs_human
+
+    rng = np.random.default_rng(0)
+    n = 200
+    human = rng.integers(3, size=n)
+    teacher = np.where(rng.random(n) < 0.93, human, (human + 1) % 3)  # teacher 93% right
+    conf = rng.random(n)
+    pred = np.where(rng.random(n) < 0.5 + 0.5 * conf, human, (human + 2) % 3)  # confident rows more right
+    tau = choose_tau_vs_human(conf, pred, teacher, human)
+    acc = lambda t: (np.where(conf >= t, pred, teacher) == human).mean()
+    best = max(acc(t) for t in sorted(conf) + [math.inf])
+    assert acc(tau) >= best - math.sqrt(best * (1 - best) / n)
+    assert all(acc(t) < best - math.sqrt(best * (1 - best) / n) for t in sorted(conf) if t < tau)  # most coverage
+    assert choose_tau_vs_human(conf, pred, teacher, np.full(n, -1)) is None  # no human labels: caller falls back
 
 
 def test_retraining_reads_logs_and_queue_together(trained, tmp_path, write_jsonl):

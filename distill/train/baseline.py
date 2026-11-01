@@ -15,15 +15,18 @@ import numpy as np
 from distill.calibrate.temperature import ece, fit_temperature, nll, softmax
 from distill.dataset.build import by_task, dedupe, time_split
 from distill.logs.ingest import Decision, options, read_many
-from distill.serve.gate import choose_tau, gate_metrics
+from distill.serve.gate import choose_tau, choose_tau_vs_human, gate_metrics
 from distill.serve.student import Student
 from distill.train.linear_head import LinearHead
 
 L2_GRID = (1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0)
 GATE_CURVE = (0.8, 0.85, 0.9, 0.95, 0.99)
-# Agreement with a noisy teacher is capped by its noise: at 0.95 a 10%-noise teacher got ~96% of AG News traffic
-# back, though the student was more accurate. Read the printed curve and pick for your own data.
-DEFAULT_TARGET = 0.85
+# "auto": τ that makes the gated system most accurate vs human labels on calib (one-SE rule, see
+# choose_tau_vs_human). Without enough human labels it falls back to an agreement target: agreement with a noisy
+# teacher is capped by its noise (at 0.95 a 10%-noise teacher got ~96% of AG News traffic back, though the
+# student was more accurate), so the fallback is 0.85. Read the printed curve either way.
+DEFAULT_TARGET = "auto"
+AGREEMENT_FALLBACK = 0.85
 
 
 def _acc(pred: np.ndarray, labels: list[str | None], classes: list[str]) -> tuple[float | None, int]:
@@ -34,7 +37,7 @@ def _acc(pred: np.ndarray, labels: list[str | None], classes: list[str]) -> tupl
     return float(np.mean([classes[pred[i]] == labels[i] for i in idx])), len(idx)
 
 
-def evaluate_task(rows: list[Decision], extract, fractions=(0.7, 0.15, 0.15), target_agreement: float = DEFAULT_TARGET,
+def evaluate_task(rows: list[Decision], extract, fractions=(0.7, 0.15, 0.15), target_agreement=DEFAULT_TARGET,
                   save_dir=None) -> dict:
     classes = options(rows[0].question)
     split = time_split(rows, fractions)
@@ -61,7 +64,8 @@ def evaluate_task(rows: list[Decision], extract, fractions=(0.7, 0.15, 0.15), ta
     head, init, calib_nll = select_head(Xtr, ytr, Xc, yc, len(classes), prior)
     Lc, Lt = head.logits(Xc), head.logits(Xte)
     gate = gate_and_student(rows, head, Lc, yc, Lt, yte, humans, target_agreement,
-                            {**getattr(extract, "meta", {}), "l2": head.l2, "init": init}, save_dir)
+                            {**getattr(extract, "meta", {}), "l2": head.l2, "init": init}, save_dir,
+                            [d.human_label for d in split.calib])
     teacher_vs_human, n_human = _acc(yte, humans, classes)
     report = {
         "n": sizes,
@@ -79,24 +83,33 @@ def evaluate_task(rows: list[Decision], extract, fractions=(0.7, 0.15, 0.15), ta
     return report
 
 
-def gate_and_student(rows, head, Lc, yc, Lt, yte, humans, target_agreement, meta, save_dir=None) -> dict:
+def gate_and_student(rows, head, Lc, yc, Lt, yte, humans, target_agreement, meta, save_dir=None,
+                     calib_humans=None) -> dict:
     """Temperature, τ and the gate report from a student's calib/test logits; saves the student if asked.
-    Shared by the linear head and LoRA so both are gated, reported and served the same way."""
+    Shared by the linear head and LoRA so both are gated, reported and served the same way.
+    `target_agreement`: a float, or "auto" to choose τ on calib human labels (`calib_humans`)."""
     q, task = rows[0].question, rows[0].task
     classes = options(q)
     T = fit_temperature(Lc, yc)
     Pc, Pt = softmax(Lc / T), softmax(Lt / T)
     # τ from calib (yet another use of that slice, after l2, init and T); the test block is the honest estimate.
-    tau = choose_tau(Pc.max(1), Pc.argmax(1) == yc, target_agreement)
+    to_idx = lambda hs: np.array([classes.index(h) if h is not None else -1 for h in hs], dtype=int)
+    human_idx, calib_human = to_idx(humans), to_idx(calib_humans or [None] * len(yc))
+    chosen, tau = target_agreement, None
+    if target_agreement == "auto":
+        tau = choose_tau_vs_human(Pc.max(1), Pc.argmax(1), yc, calib_human)
+        if tau is None:
+            chosen = AGREEMENT_FALLBACK  # too few human labels on calib to optimise accuracy against
+    if tau is None:
+        tau = choose_tau(Pc.max(1), Pc.argmax(1) == yc, chosen)
     costs = [d.cost_usd for d in rows if d.cost_usd is not None]
-    human_idx = np.array([classes.index(h) if h is not None else -1 for h in humans])
     cost = float(np.mean(costs)) if costs else None
 
     def test_gate(t):
         return gate_metrics(Pt.max(1), Pt.argmax(1), yte, t, human_idx, cost)
 
-    gate = {"target_agreement": target_agreement,
-            "calib": gate_metrics(Pc.max(1), Pc.argmax(1), yc, tau),
+    gate = {"target_agreement": chosen,  # "auto", or the agreement target actually used
+            "calib": gate_metrics(Pc.max(1), Pc.argmax(1), yc, tau, calib_human),
             "test": test_gate(tau),
             # The target is a business choice, not a model parameter: show what each one buys on test. With a
             # noisy teacher, high agreement targets fall back to it even where the student is more accurate.
@@ -138,6 +151,16 @@ def run(paths, extract, target_agreement: float = DEFAULT_TARGET, save_dir=None)
     }
 
 
+def parse_target(s: str):
+    """`auto`, or an agreement target in (0, 1]."""
+    if s == "auto":
+        return s
+    v = float(s)
+    if not 0 < v <= 1:
+        raise argparse.ArgumentTypeError("must be 'auto' or a number in (0, 1]")
+    return v
+
+
 def make_extractor(features: str, model: str = "LiquidAI/d1-3B", device=None, dtype=None):
     if features == "d1":
         import torch
@@ -158,12 +181,10 @@ def main(argv=None) -> None:
     p.add_argument("--device")
     # fp32 (the card's CPU default) needs ~12.5 GB for d1-3B; use bfloat16 on smaller machines.
     p.add_argument("--dtype", choices=["float32", "bfloat16"])
-    p.add_argument("--target-agreement", type=float, default=DEFAULT_TARGET,
+    p.add_argument("--target-agreement", type=parse_target, default=DEFAULT_TARGET,
                    help="gate: the student answers only where calib says it agrees with the teacher this often")
     p.add_argument("--save", metavar="DIR", help="write one deployable student per task here")
     args = p.parse_args(argv)
-    if not 0 < args.target_agreement <= 1:
-        p.error("--target-agreement must be in (0, 1]")
     report = run(args.logs, make_extractor(args.features, args.model, args.device, args.dtype),
                  args.target_agreement, args.save)
     for task, t in report["tasks"].items():
@@ -176,7 +197,11 @@ def main(argv=None) -> None:
 def format_curve(task: str, gate: dict) -> str:
     """The gate's trade-off on test, one line per agreement target, the chosen one marked."""
     fmt = lambda v, spec: "   –" if v is None else format(v, spec)
-    lines = [f"[{task}] gate curve on test (chosen target {gate['target_agreement']:g}):",
+    chosen = gate["target_agreement"]
+    t = gate["test"]
+    lines = [f"[{task}] gate on test: target {chosen}, τ={t['tau']:.3f}, fallback {t['fallback_rate']:.1%}, "
+             f"acc vs human {fmt(t.get('system_accuracy_vs_human'), '.3f').strip()}",
+             "  curve over fixed agreement targets (* = the one used):",
              "  target  fallback  agree(accepted)  acc vs human  cost/1k gated"]
     for c in gate["curve"]:
         mark = " *" if c["target"] == gate["target_agreement"] else "  "
