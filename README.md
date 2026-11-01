@@ -2,16 +2,17 @@
 
 Turn your LLM decisions into a local decision model. See [SPEC.md](SPEC.md) for the full design.
 
-Status: **M0** (log schema, ingestion, dedupe, time split), **M1** (linear head on frozen d1-3B features,
-temperature scaling, accuracy + ECE), **M3** (confidence-gated serving with teacher fallback) and **M4**
-(drift alarms, active learning, simulated drift scenario) and **M2** (LoRA fine-tune, compared with the linear
-head: on AG News it doesn't clearly beat it; see below). LoRA students are evaluated, not yet served.
+Status: every SPEC milestone and the v1 scope. **M0** log schema, ingestion, dedupe, time split. **M1** linear
+head on frozen d1-3B features, temperature scaling, accuracy + ECE. **M2** LoRA fine-tune, compared with the
+head and servable. **M3** confidence-gated serving with teacher fallback. **M4** drift alarms, active learning,
+simulated drift. **v1** active-learning queue CLI and a cost dashboard.
 
 ```
-logs.jsonl ─▶ baseline --save ─▶ students/ ─▶ serve.app (gate) ─▶ answer
-                    ▲                               │ conf < τ ─▶ teacher ─▶ queue.jsonl (log format)
-                    └───────── retrain on logs + queue ◀────────┘
-                                                    └ /monitor: PSI, shadow agreement, alarms
+logs.jsonl ─▶ baseline | lora --save ─▶ students/ ─▶ serve.app (gate) ─▶ answer
+                    ▲                                     │ conf < τ ─▶ teacher ─▶ queue.jsonl (log format)
+                    │                                     ├ --pool ─▶ monitor.active ─▶ teacher ─▶ queue.jsonl
+                    └──── baseline logs.jsonl queue.jsonl ◀┘
+                                                          └ /monitor, /dashboard: cost, PSI, agreement, alarms
 ```
 
 ## Install
@@ -20,6 +21,7 @@ logs.jsonl ─▶ baseline --save ─▶ students/ ─▶ serve.app (gate) ─�
 pip install -e ".[dev]"        # core: numpy only (+ pytest, fastapi, httpx for the tests)
 pip install -e ".[d1]"         # + torch, transformers>=5.14 for d1-3B features
 pip install -e ".[serve]"      # + fastapi, uvicorn for the HTTP gate
+pip install -e ".[lora]"       # + peft for the LoRA fine-tune
 ```
 
 ## Log format (JSONL, one teacher decision per line)
@@ -41,6 +43,7 @@ Timestamps must carry a timezone. Bad lines are skipped and reported with their 
 ```bash
 python -m distill.train.baseline logs.jsonl --features d1       # frozen d1-3B features
 python -m distill.train.baseline logs.jsonl --features hashing  # model-free floor
+python -m distill.train.baseline logs.jsonl queue.jsonl --save students/  # retrain on logs + serving queue
 ```
 
 On CPU, pass `--dtype bfloat16` unless you have well over 12.5 GB of free RAM. fp32 d1-3B thrashed a
@@ -68,12 +71,16 @@ Calibration picks zero init. The prior's 4-row test lead is inside the noise of 
 calibration slice because of it would be picking on test.
 
 **Gate.** τ is chosen on calib as the threshold that accepts the most rows while those rows agree with the
-teacher at ≥ `--target-agreement` (default 0.95). `gate.calib` is that choice; `gate.test` is the honest
+teacher at ≥ `--target-agreement` (default **0.85**). `gate.calib` is that choice; `gate.test` is the honest
 estimate: fallback rate, agreement on accepted rows, agreement and human accuracy of the whole gated system,
 and cost per 1k decisions (teacher only vs gated, from the logs' `cost_usd`; the local student's cost isn't
-counted). `--save students/` writes one deployable student per task (head, T, τ, drift reference).
+counted). Every run prints the trade-off curve over targets to stderr, the chosen one marked `*`: the target
+is a business choice, and agreement with a noisy teacher is capped by its noise (at 0.95 a 10%-noise teacher
+got ~96% of AG News traffic back, though the student was more accurate). `--save students/` writes one
+deployable student per task (head, T, τ, drift reference, agreement baselines, teacher cost).
 
-Simulated logs from AG News for a quick end-to-end run: `python scripts/simulate_logs.py > logs.jsonl`.
+Simulated logs from AG News: `python scripts/simulate_logs.py > logs.jsonl` (topics, which d1 reads well),
+or `--policy house` (opaque queue names and a hidden routing rule, which d1 can't know; see Results).
 
 ## Serve (M3)
 
@@ -93,15 +100,29 @@ is never queued.
 time, with the logged label as the teacher: the check that served fallback rate and agreement match the
 offline estimate.
 
+**`/dashboard`** (SPEC v1 cost dashboard) shows per task: requests, fallback rate, teacher calls, cost per
+1k decisions gated vs teacher-only and the saving, PSI, both agreement streams, and alarms; it refreshes
+every 10 s. Live cost counts every teacher call, shadow checks included, which the offline estimate doesn't.
+
+**LoRA students** (`distill.train.lora --save students/`) serve through the same gate. LoRA only changes the
+backbone, so the student is d1's own option-token rows as a fixed head over adapted features. The adapter is
+saved next to it and loaded in fp32. One process serves one adapter; students trained on different features
+are refused, not mixed.
+
 ## Monitor and active learning (M4)
 
 - **PSI** over the student's predicted classes in a rolling window vs the pre-deployment reference; alarm
   at > 0.2 once 100 predictions are in. Needs no labels, so it sees every request; it catches inputs moving.
 - **Shadow agreement**: the random shadow sample's agreement with the teacher; alarm below the offline
   agreement − 0.1 once 30 shadow labels are in. It catches the right answer moving, which PSI can't see.
-- **Active learning** (`distill.monitor.active.prioritize`): which unlabeled requests (`--pool`) to send to
-  the teacher. Normalized entropy plus how under-represented the request's cluster (cosine k-means) is in
-  training. Never use it for the shadow sample: agreement needs a random sample.
+- **Active learning** (`distill.monitor.active`): which unlabeled requests (`--pool`) to send to the teacher.
+  Normalized entropy plus how under-represented the request's cluster (cosine k-means) is in training. Never
+  use it for the shadow sample: agreement needs a random sample.
+
+  ```bash
+  python -m distill.monitor.active students/ pool.jsonl logs.jsonl --budget 50 \
+      --teacher mypkg.llm:ask --queue queue.jsonl   # omit --teacher/--queue to just print the ranking
+  ```
 
 - **Fallback agreement**: every fallback is teacher-labeled anyway, so the student's own guess vs the teacher's
   answer there is a second agreement stream, against its own calib baseline (`rejected_agreement`). When the
