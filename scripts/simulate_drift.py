@@ -6,8 +6,10 @@
 Era A (training): science/tech is rare (5%). Then four streams through the real Gateway:
   stable   same mix as era A, fresh rows         → M3: replayed gate ≈ offline estimate; no alarms
   surge    science/tech at 55%                   → PSI alarm (covariate drift)
-  concept  stable inputs, teacher now files business as world → shadow-agreement alarm, PSI quiet
-  active   label B surge rows chosen by prioritize() vs at random, retrain, score on held-out surge rows
+  concept  stable inputs, teacher now files business as world → agreement alarm, PSI quiet
+  active   label B pool rows chosen by prioritize() vs at random, retrain, score on held-out rows:
+           surge pool (science/tech 55%) and the fair test, a rare pool (science/tech 12%) scored on a
+           balanced held-out set and on science/tech alone
 
 The teacher is AG News' gold label with 10% uniform noise. shortcut: real LLM errors cluster on hard inputs.
 """
@@ -40,6 +42,8 @@ QUESTION = {
 NAMES = list(QUESTION["criteria"])
 RARE = [0.3167, 0.3167, 0.3166, 0.05]
 SURGE = [0.15, 0.15, 0.15, 0.55]
+RARE_POOL = [0.2933, 0.2933, 0.2934, 0.12]
+BALANCED = [0.25, 0.25, 0.25, 0.25]
 
 
 class Cached:
@@ -108,31 +112,46 @@ def main():
     report["m4_surge"] = stream(surge, lambda task, state, q: label[state])
     report["m4_concept"] = stream(stable, lambda task, state, q: "world" if label[state] == "business" else label[state])
 
-    # Active learning: B teacher labels from the surge pool, chosen vs random, then retrain and score.
+    # Active learning: B teacher labels from a pool, chosen vs random, then retrain and score.
     split = time_split(by_task(era_a)["news_section"])
-    pool, held = surge[:300], surge[300:]
-    Xtr, Xp, Xh = (extract([d.state for d in part], QUESTION) for part in (split.train, pool, held))
-    ytr, yp, yh = (np.array([NAMES.index(d.label) for d in part]) for part in (split.train, pool, held))
-    hh = np.array([NAMES.index(d.human_label) for d in held])
+    Xtr = extract([d.state for d in split.train], QUESTION)
+    ytr = np.array([NAMES.index(d.label) for d in split.train])
     prior = extract.readout_weights(QUESTION) if s.meta.get("init") == "prior" else None
-    P_pool = s.probs(Xp)
+    budgets = list(map(int, args.budgets.split(",")))
 
-    def retrained(idx):
-        h = LinearHead(l2=s.head.l2).fit(np.vstack([Xtr, Xp[idx]]), np.r_[ytr, yp[idx]], 4, prior)
-        pred = h.logits(Xh).argmax(1)
-        return {"vs_teacher": float((pred == yh).mean()), "vs_human": float((pred == hh).mean())}
+    def experiment(pool, held, n_random):
+        Xp, Xh = extract([d.state for d in pool], QUESTION), extract([d.state for d in held], QUESTION)
+        yp = np.array([NAMES.index(d.label) for d in pool])
+        hh = np.array([NAMES.index(d.human_label) for d in held])
+        new = hh == NAMES.index("scitech")
+        P_pool = s.probs(Xp)
 
-    al = {"no_new_labels": retrained(np.array([], dtype=int)),
-          "pool_scitech_share": float(np.mean([d.human_label == "scitech" for d in pool]))}
-    for b in map(int, args.budgets.split(",")):
-        picks = {"active": prioritize(P_pool, Xp, Xtr, b), "entropy_only": prioritize(P_pool, Xp, Xtr, b, weight=0.0)}
-        al[f"budget_{b}"] = {
-            **{name: {**retrained(i), "scitech_share": float(np.mean([pool[j].human_label == "scitech" for j in i]))}
-               for name, i in picks.items()},
-            "random_mean_of_5": {k: float(np.mean([retrained(np.random.default_rng(r).choice(len(pool), b, replace=False))[k]
-                                                   for r in range(5)])) for k in ("vs_teacher", "vs_human")},
-        }
-    report["m4_active_learning"] = al
+        def retrained(idx):
+            h = LinearHead(l2=s.head.l2).fit(np.vstack([Xtr, Xp[idx]]), np.r_[ytr, yp[idx]], 4, prior)
+            ok = h.logits(Xh).argmax(1) == hh
+            return {"vs_human": float(ok.mean()), "scitech_vs_human": float(ok[new].mean())}
+
+        out = {"pool_scitech_share": float(np.mean([d.human_label == "scitech" for d in pool])),
+               "held_out": {"n": len(held), "n_scitech": int(new.sum())},
+               "no_new_labels": retrained(np.array([], dtype=int))}
+        for b in budgets:
+            picks = {"active": prioritize(P_pool, Xp, Xtr, b), "entropy_only": prioritize(P_pool, Xp, Xtr, b, weight=0.0)}
+            rand = [retrained(np.random.default_rng(r).choice(len(pool), b, replace=False)) for r in range(n_random)]
+            out[f"budget_{b}"] = {
+                **{name: {**retrained(i), "scitech_share_of_picks": float(np.mean([pool[j].human_label == "scitech"
+                                                                                    for j in i]))}
+                   for name, i in picks.items()},
+                f"random_{n_random}_seeds": {k: {"mean": float(np.mean([r[k] for r in rand])),
+                                                 "min": float(min(r[k] for r in rand)),
+                                                 "max": float(max(r[k] for r in rand))} for k in rand[0]},
+            }
+        return out
+
+    # Surge pool: the new region is already the majority, so random labels find it too.
+    report["m4_active_learning_surge"] = experiment(surge[:300], surge[300:], 5)
+    # The fair test: the new region is a small share of incoming traffic (12%, vs 5% in training), so random
+    # labels rarely reach it. Scored on a balanced held-out set, and on science/tech alone.
+    report["m4_active_learning_rare"] = experiment(rows(400, RARE_POOL, "r"), rows(300, BALANCED, "b"), 10)
     json.dump(report, sys.stdout, indent=2, default=float)
     print()
 

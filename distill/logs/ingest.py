@@ -74,6 +74,16 @@ def parse(row: dict) -> Decision:
     )
 
 
+def read_many(paths, strict: bool = False) -> tuple[list[Decision], list[str]]:
+    """Several log files as one, e.g. the original logs plus the serving queue. Errors name their file."""
+    records, errors = [], []
+    for path in [paths] if isinstance(paths, (str, Path)) else paths:
+        r, e = read_jsonl(path, strict)
+        records += r
+        errors += [f"{path}: {x}" for x in e]
+    return records, errors
+
+
 def read_jsonl(path: str | Path, strict: bool = False) -> tuple[list[Decision], list[str]]:
     """Records and `"line N: reason"` errors. Bad lines are skipped, or raise when `strict`."""
     records: list[Decision] = []
