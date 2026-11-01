@@ -22,7 +22,8 @@ from distill.calibrate.temperature import ece, fit_temperature, nll, softmax
 from distill.dataset.build import by_task, dedupe, time_split
 from distill.logs.ingest import options, read_many
 from distill.serve.student import student_stem
-from distill.train.baseline import DEFAULT_TARGET, _acc, evaluate_task, format_curve, gate_and_student
+from distill.train.baseline import (DEFAULT_TARGET, _acc, evaluate_task, format_curve, gate_and_student,
+                                    parse_target)
 from distill.train.linear_head import LinearHead
 
 TARGETS = ["q_proj", "k_proj", "v_proj", "out_proj", "in_proj"]  # attention and short-conv projections
@@ -133,7 +134,7 @@ def compare_task(rows, f, target_agreement=DEFAULT_TARGET, save_dir=None, **lora
     config = {"r": lora_kw.get("r", 8), "lora_alpha": lora_kw.get("alpha", 16), "target_modules": TARGETS}
     gate = gate_and_student(rows, head, Lc, yc, Lt, yt, humans, target_agreement,
                             {**f.meta, "adapter": None if stem is None else stem.name + ".adapter.pt",
-                             "lora_config": config}, save_dir)
+                             "lora_config": config}, save_dir, [d.human_label for d in split.calib])
     if stem is not None:
         f.torch.save(adapter_state(f.model.model.language_model), stem.with_suffix(".adapter.pt"))
     T = fit_temperature(Lc, yc)
@@ -153,7 +154,7 @@ def main(argv=None) -> None:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("logs", nargs="+", help="log files, e.g. logs.jsonl queue.jsonl")
     p.add_argument("--model", default="LiquidAI/d1-3B")
-    p.add_argument("--target-agreement", type=float, default=DEFAULT_TARGET)
+    p.add_argument("--target-agreement", type=parse_target, default=DEFAULT_TARGET)
     p.add_argument("--save", metavar="DIR", help="write the LoRA student and its adapter here, for distill.serve")
     p.add_argument("--dtype", choices=["float32", "bfloat16"])
     p.add_argument("--epochs", type=int, default=2)

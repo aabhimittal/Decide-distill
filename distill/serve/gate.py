@@ -37,6 +37,22 @@ def choose_tau(conf: np.ndarray, correct: np.ndarray, target: float) -> float:
     return float(conf[order][ok[-1]]) if len(ok) else math.inf
 
 
+def choose_tau_vs_human(conf: np.ndarray, pred: np.ndarray, teacher: np.ndarray, human: np.ndarray,
+                        min_labels: int = 20) -> float | None:
+    """The threshold that makes the gated system most accurate against human labels on these rows, then the
+    most coverage within one standard error of that best: on ~100 calib rows, 0.942 and 0.933 are the same
+    number, and only a real difference is worth paying the teacher for. `human` uses -1 for missing; None
+    when fewer than `min_labels` rows have one (the caller falls back to an agreement target)."""
+    m = human >= 0
+    if m.sum() < min_labels:
+        return None
+    candidates = sorted(set(conf.tolist())) + [math.inf]  # accept-all … reject-all
+    acc = [float((np.where(conf[m] >= t, pred[m], teacher[m]) == human[m]).mean()) for t in candidates]
+    best = max(acc)
+    se = math.sqrt(best * (1 - best) / m.sum())
+    return min(t for t, a in zip(candidates, acc) if a >= best - se)  # lowest τ: most traffic to the student
+
+
 def gate_metrics(conf: np.ndarray, pred: np.ndarray, teacher: np.ndarray, tau: float,
                  human: np.ndarray | None = None, teacher_cost: float | None = None) -> dict:
     """What the gated system does on these rows. `human` uses -1 for a missing label."""

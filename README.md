@@ -5,7 +5,8 @@ Turn your LLM decisions into a local decision model. See [SPEC.md](SPEC.md) for 
 Status: every SPEC milestone and the v1 scope. **M0** log schema, ingestion, dedupe, time split. **M1** linear
 head on frozen d1-3B features, temperature scaling, accuracy + ECE. **M2** LoRA fine-tune, compared with the
 head and servable. **M3** confidence-gated serving with teacher fallback. **M4** drift alarms, active learning,
-simulated drift. **v1** active-learning queue CLI and a cost dashboard.
+simulated drift. **v1** active-learning queue CLI and a cost dashboard. Gate target chosen on calib human
+labels (`auto`), and results against a real LLM teacher.
 
 ```
 logs.jsonl ─▶ baseline | lora --save ─▶ students/ ─▶ serve.app (gate) ─▶ answer
@@ -70,8 +71,11 @@ with no training it reproduces zero-shot exactly; it is only on offer with d1 fe
 Calibration picks zero init. The prior's 4-row test lead is inside the noise of 90 rows, and overruling the
 calibration slice because of it would be picking on test.
 
-**Gate.** τ is chosen on calib as the threshold that accepts the most rows while those rows agree with the
-teacher at ≥ `--target-agreement` (default **0.85**). `gate.calib` is that choice; `gate.test` is the honest
+**Gate.** By default (`--target-agreement auto`) τ is chosen on calib to make the gated system most accurate
+against the human labels there, taking the lowest τ (most student coverage) within one standard error of the
+best. With fewer than 20 calib human labels it falls back to an agreement target of 0.85. A number instead
+(`--target-agreement 0.9`) picks the τ that accepts the most rows while those rows agree with the teacher at
+≥ that rate. `gate.calib` is that choice; `gate.test` is the honest
 estimate: fallback rate, agreement on accepted rows, agreement and human accuracy of the whole gated system,
 and cost per 1k decisions (teacher only vs gated, from the logs' `cost_usd`; the local student's cost isn't
 counted). Every run prints the trade-off curve over targets to stderr, the chosen one marked `*`: the target
@@ -152,14 +156,14 @@ The fallback gap is 5 points, about 1.4 combined standard errors on these row co
 | target agreement | fallback | system acc vs human | cost / 1k decisions |
 |---|---|---|---|
 | 0.80 | 0.8% | 0.917 | $0.003 |
-| **0.85 (default)** | 10.8% | **0.958** | $0.043 |
+| **0.85** (the default before `auto`) | 10.8% | **0.958** | $0.043 |
 | 0.90 | 93.3% | 0.917 | $0.373 |
 | 0.95 | 96.7% | 0.908 | $0.387 |
 
 A 10%-noise teacher caps how often anyone can agree with it, so high targets reject almost everything and
 hand rows to a teacher that is *less* accurate than the student. At 0.85 the gate sends only the student's
-shaky rows to the teacher and beats both (student 0.917, teacher ≈ 0.90). The default is a starting point:
-on the house task below the best target is 0.80, not 0.85. Read the curve every run prints.
+shaky rows to the teacher and beats both (student 0.917, teacher ≈ 0.90). On the house task below the best
+target is 0.80, not 0.85: no fixed target is right everywhere, which is why the default is now `auto`.
 
 **M4: drift alarms** (window 500; PSI alarm at 0.2; agreement alarms at their calib baseline − 0.1; this
 scenario shadows every accepted answer):
@@ -209,8 +213,8 @@ would have sent 88% back: pick the target from the curve. Temperature scaling ma
 task (0.064 → 0.113 for the head): T is fitted on 120 calibration rows.
 
 **LoRA still doesn't beat the head**, even where d1 knows nothing: the same test accuracy, a slightly worse
-calib NLL, at ~28 minutes of CPU against seconds. Calib NLL was still falling at epoch 2, so more epochs might
-help; that isn't tested.
+calib NLL, at ~28 minutes of CPU against seconds. Calib NLL was still falling at epoch 2; four epochs with
+the real teacher (below) peaked at epoch 3 and still tied the head on test.
 
 **Served LoRA student (M3 for LoRA).** `lora --save` then `serve.replay` on 300 fresh house rows, target 0.85:
 
@@ -224,6 +228,43 @@ help; that isn't tested.
 Fallback, accuracy and cost carry over. Agreement on accepted rows drops 9 points, about 2 combined standard
 errors (calib had 0.851). The served readout (primary option tokens) picks the same answer as d1's
 max-pooled readout on 100% of test rows.
+
+## Results: a real LLM teacher (`scripts/llm_teacher.py`)
+
+The runs above use a simulated teacher with uniform 10% noise. Here the teacher is a real LLM,
+Qwen2.5-3B-Instruct, run locally. It decides by option-letter logits:
+`python scripts/llm_teacher.py logs.jsonl > logs_llm.jsonl` relabels any log. On the house task its own prompt
+spells out the routing policy, while the logged question stays opaque ("Queue 1".."Queue 3"). Its errors are
+systematic, not random:
+
+- house: 0.805 vs human on 800 rows, 116 of its 155 errors are q2→q1 (business with digits);
+- AG News: 0.795 vs human, mostly science/tech filed as business or world;
+- it is about 0.97–0.99 confident when wrong, so its own confidence is no signal.
+
+Qwen's license is fine for generating evaluation logs, not for shipping. Same splits as above (120 / 90 test
+rows), d1 bf16 on CPU, gate `auto`:
+
+| test, vs human | d1 zero-shot | head | LoRA (epoch 3 of 4) | teacher | gated system (`auto`) |
+|---|---|---|---|---|---|
+| house | 0.258 | 0.825 | 0.825 | 0.867 | 0.842 (head, 7.5% fallback) |
+| AG News | **0.822** | 0.700 | – | 0.700 | 0.700 (4.4% fallback) |
+
+- **The student learns the teacher, mistakes included.** On AG News the head agrees with the teacher on 94%
+  of test rows and sits at exactly the teacher's 0.700 vs human, below untrained d1 (0.822). Distillation
+  from a worse teacher made d1 worse, and no gate can fix it: every fallback goes to that same teacher.
+  Compare zero-shot against the teacher on human labels *before* distilling.
+- **`auto` behaved sensibly but has little room.** House: 7.5% fallback, 0.842 vs human; the most accurate
+  point on the curve was 0.867 at 73% fallback, which the one-SE rule correctly turns down as within noise.
+  On AG News, falling back can't beat the teacher, so `auto` keeps almost everything.
+- **Fresh traffic:** the head student replayed on 300 new house rows gets 0.783 vs human at 4.3% fallback,
+  against 0.842 offline. The teacher scored 0.82 on those rows, so the fresh slice is harder. Fallback
+  agreement is 0.46: the rows the gate sends back are ones the student and the teacher disagree on.
+- **LoRA, 4 epochs:** calib NLL 0.447 → 0.398 → **0.384** → 0.492 (epoch 4 overfits; epoch 3 kept). That
+  is its first calib win over the head (0.414), but test accuracy ties at 0.825, and `auto` gave LoRA 0%
+  fallback. About 65 minutes of CPU against 6 for the head.
+
+With 120 test rows one standard error is about 0.035: every head-to-head gap here except zero-shot vs the
+student on AG News is inside it.
 
 ## LoRA fine-tune (M2)
 
