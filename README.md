@@ -135,50 +135,95 @@ are refused, not mixed.
 Era A (training, 800 logs): science/tech is 5% of traffic. Teacher = gold label with 10% uniform noise. Calib
 picked the readout prior at l2=10: 0.917 vs human on the 120 test rows (zero-shot d1: 0.908).
 
-**M3: served gate vs offline estimate.** 300 fresh era-A rows through the gate loaded from disk:
+**M3: served gate vs offline estimate**, at the default target 0.85; 300 fresh era-A rows through the gate
+loaded from disk:
 
-| at target 0.95 | offline (test slice) | served (fresh rows) |
+| | offline (test slice) | served (fresh rows) |
 |---|---|---|
-| fallback rate | 0.967 | 0.960 |
-| agreement on accepted rows | 1.000 | 1.000 |
-| system accuracy vs human | 0.908 | 0.903 |
+| fallback rate | 0.108 | 0.157 |
+| agreement on accepted rows | 0.850 | 0.877 |
+| system accuracy vs human | 0.958 | 0.953 |
+| cost / 1k decisions (teacher only: $0.40) | $0.043 | $0.063 |
 
-**The gate's target is the knob that matters, and 0.95 is a poor choice here.** Test-slice curve:
+The fallback gap is 5 points, about 1.4 combined standard errors on these row counts.
+
+**The target is the knob that matters.** Test-slice curve for this task:
 
 | target agreement | fallback | system acc vs human | cost / 1k decisions |
 |---|---|---|---|
 | 0.80 | 0.8% | 0.917 | $0.003 |
-| 0.85 | 10.8% | **0.958** | $0.043 |
+| **0.85 (default)** | 10.8% | **0.958** | $0.043 |
 | 0.90 | 93.3% | 0.917 | $0.373 |
-| 0.95 (default) | 96.7% | 0.908 | $0.387 |
+| 0.95 | 96.7% | 0.908 | $0.387 |
 
 A 10%-noise teacher caps how often anyone can agree with it, so high targets reject almost everything and
 hand rows to a teacher that is *less* accurate than the student. At 0.85 the gate sends only the student's
-shaky rows to the teacher and beats both (student 0.917, teacher ≈ 0.90). Pick the target from this curve on
-your own data. It is measured on 120 rows, and the 0.85 → 0.90 cliff (τ 0.61 → 0.88) shows how coarse that is.
+shaky rows to the teacher and beats both (student 0.917, teacher ≈ 0.90). The default is a starting point:
+on the house task below the best target is 0.80, not 0.85. Read the curve every run prints.
 
-**M4: drift alarms** (rolling window 500; PSI alarm at 0.2; agreement alarms at baseline − 0.1):
+**M4: drift alarms** (window 500; PSI alarm at 0.2; agreement alarms at their calib baseline − 0.1; this
+scenario shadows every accepted answer):
 
-| stream | PSI | fallback agreement (baseline 0.798) | alarms |
+| stream | PSI | shadow agreement | alarms |
 |---|---|---|---|
-| stable, fresh era-A rows | 0.018 | 0.837 | none |
-| surge: science/tech 55% | **0.856** | 0.652 | PSI, fallback agreement |
-| concept: teacher files business as world | 0.018 | **0.569** | fallback agreement only |
+| stable, fresh era-A rows | 0.018 | – | none |
+| surge: science/tech 55% | **0.856** | 0.686 | PSI, shadow agreement |
+| concept: teacher files business as world | 0.018 | **0.621** | shadow agreement only |
 
-Shadow agreement on accepted rows never had enough samples (8 and 12; it needs 30), because the gate accepted
-so little at target 0.95. Without the fallback stream, the concept drift would have gone unseen.
+At a 0.95 target the gate accepted so little that shadow agreement had 8–12 samples and concept drift showed
+up only in the fallback stream (0.569 vs a 0.798 baseline). Both streams exist for that reason.
 
-**M4: active learning does not beat random here.** Retrained on era A + B surge labels, scored on 300
-held-out surge rows vs human:
+**M4: active learning, the fair test.** The new region (science/tech, 5% of training) is a small share of a
+400-row pool (15% as sampled), so random labels rarely reach it. Retrain on era A + B pool labels, score on a
+balanced held-out set (300 rows, 66 science/tech) vs human; random is 10 seeds (mean, range):
 
-| budget | prioritize() | entropy only | random (mean of 5) | no new labels |
-|---|---|---|---|---|
-| 30 | 0.830 | 0.797 | 0.814 | 0.730 |
-| 60 | 0.833 | 0.833 | 0.840 | 0.730 |
+| budget | | prioritize() | entropy only | random | no new labels |
+|---|---|---|---|---|---|
+| 30 | overall | **0.886** | 0.876 | 0.858 (0.853–0.866) | 0.850 |
+| 30 | science/tech | **0.681** | 0.636 | 0.553 (0.530–0.590) | 0.515 |
+| 60 | overall | **0.890** | 0.886 | 0.868 (0.860–0.876) | 0.850 |
+| 60 | science/tech | **0.696** | 0.681 | 0.595 (0.560–0.636) | 0.515 |
 
-`prioritize()` does find the gap (90–93% of its picks are science/tech, against 56% of the pool), but the
-surge pool is already majority science/tech, so random labels fill the same gap. A scenario where the new
-region is a small share of the pool would test it properly; not run yet.
+`prioritize()` beats every random seed at both budgets, and the cluster term adds to entropy alone. When the
+new region is already the majority of the pool (the surge pool, 56% science/tech), random finds it too and
+there is no difference (60 labels: 0.833 vs 0.840). One pool draw and 66 science/tech rows: a clear direction,
+not a precise size.
+
+## Results: a task d1 can't know (`scripts/simulate_logs.py --policy house`)
+
+Opaque options ("Queue 1".."Queue 3") and a hidden routing rule over AG News: world → q1, sports → q3,
+science/tech → q2, business → q2 if the article contains a digit, else q1. 800 logs, teacher with 10% noise,
+120 time-split test rows:
+
+| | calib NLL | test acc vs human | test ECE after scaling |
+|---|---|---|---|
+| d1 zero-shot | 1.096 | 0.258 | 0.089 |
+| linear head, frozen d1 features (zero init, l2=1) | **0.673** | 0.883 | 0.113 |
+| LoRA, epoch 2 (chosen; epoch 1: 0.754) | 0.692 | 0.883 | 0.110 |
+| the teacher, for reference | – | 0.933 | – |
+
+**This is the case the project exists for:** zero-shot d1 is below chance, and distilling 560 teacher
+decisions takes it to 0.883. Gated at target 0.80, the head falls back on 26% of traffic and the system
+reaches **0.942** vs human, above the teacher, at $0.103 per 1k against the teacher's $0.40. The default 0.85
+would have sent 88% back: pick the target from the curve. Temperature scaling made test ECE worse on this
+task (0.064 → 0.113 for the head): T is fitted on 120 calibration rows.
+
+**LoRA still doesn't beat the head**, even where d1 knows nothing: the same test accuracy, a slightly worse
+calib NLL, at ~28 minutes of CPU against seconds. Calib NLL was still falling at epoch 2, so more epochs might
+help; that isn't tested.
+
+**Served LoRA student (M3 for LoRA).** `lora --save` then `serve.replay` on 300 fresh house rows, target 0.85:
+
+| | offline (test slice) | served (fresh rows) |
+|---|---|---|
+| fallback rate | 0.392 | 0.400 |
+| system accuracy vs human | 0.925 | 0.913 |
+| agreement on accepted rows | 0.904 | 0.817 |
+| cost / 1k decisions | $0.157 | $0.160 |
+
+Fallback, accuracy and cost carry over. Agreement on accepted rows drops 9 points, about 2 combined standard
+errors (calib had 0.851). The served readout (primary option tokens) picks the same answer as d1's
+max-pooled readout on 100% of test rows.
 
 ## LoRA fine-tune (M2)
 
@@ -201,10 +246,9 @@ The report puts the frozen-feature linear head (the full baseline report) next t
 | linear head, frozen features | **0.480** | 0.867 | **0.039** |
 | LoRA, epoch 1 (epoch 2 overfit: 0.547) | 0.522 | 0.900 | 0.084 |
 
-**LoRA does not clearly beat the linear head here.** Calibration prefers the head; LoRA's test lead is 3 rows of
-90, inside the noise; it calibrates worse after scaling (SPEC §10's risk, measured); and it costs minutes of
-compute to the head's seconds. AG News is a task d1 already reads well, which favours the cheap head. A task
-whose labels d1 doesn't already understand is where LoRA should earn its cost; that is not tested yet.
+On AG News too, calibration prefers the head; LoRA's test lead is 3 rows of 90, and it calibrates worse after
+scaling (SPEC §10's risk, measured). On both tasks the cheap head is the better default; LoRA is there to try
+when a head plateaus, and the report shows whether it helped.
 
 ## How d1 features are extracted
 
