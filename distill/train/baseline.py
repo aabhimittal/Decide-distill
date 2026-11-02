@@ -79,8 +79,29 @@ def evaluate_task(rows: list[Decision], extract, fractions=(0.7, 0.15, 0.15), ta
         "gate": gate,
     }
     if hasattr(extract, "zero_shot"):  # the untrained model's own answer: the bar a student must clear
-        report["zero_shot"] = scores(extract.zero_shot(Xc, q), extract.zero_shot(Xte, q))
+        Zt = extract.zero_shot(Xte, q)
+        report["zero_shot"] = scores(extract.zero_shot(Xc, q), Zt)
+        human_idx = np.array([classes.index(h) if h is not None else -1 for h in humans])
+        report["warnings"] = worse_than_zero_shot(Zt.argmax(1), Lt.argmax(1), yte, human_idx)
     return report
+
+
+def worse_than_zero_shot(zero_shot, student, teacher, human) -> list[str]:
+    """Is the teacher, or the student it taught, worse than untrained d1 on human labels? A paired sign test
+    (McNemar) on the test rows that have one: of the rows where exactly one of the two is right, does zero-shot
+    win more than 2 standard deviations beyond an even split? Random teacher noise averages out in training;
+    a biased teacher is copied, and the gate can't fix that, since every fallback goes to the same teacher."""
+    m = human >= 0
+    out = []
+    for name, pred in (("teacher", teacher), ("student", student)):
+        z, p = zero_shot[m] == human[m], pred[m] == human[m]
+        lost, won = int((z & ~p).sum()), int((~z & p).sum())
+        if lost + won and lost - won > 2 * np.sqrt(lost + won):
+            out.append(f"{name} is less accurate vs human than d1 zero-shot: {p.mean():.3f} vs {z.mean():.3f} on "
+                       f"{int(m.sum())} rows ({lost} lost, {won} won). "
+                       + ("Distilling copies its mistakes: fix the teacher, or serve d1 zero-shot."
+                          if name == "teacher" else "Serve d1 zero-shot instead of this student."))
+    return out
 
 
 def gate_and_student(rows, head, Lc, yc, Lt, yte, humans, target_agreement, meta, save_dir=None,
@@ -118,7 +139,8 @@ def gate_and_student(rows, head, Lc, yc, Lt, yte, humans, target_agreement, meta
     if save_dir is not None:
         ref = np.bincount(np.concatenate([Pc.argmax(1), Pt.argmax(1)]), minlength=len(classes))
         Student(task, q, classes, head, T, tau, ref.tolist(), gate["calib"]["accepted_agreement"],
-                {**meta, "teacher_cost_usd": cost}, gate["calib"]["rejected_agreement"]).save(save_dir)
+                {**meta, "teacher_cost_usd": cost}, gate["calib"]["rejected_agreement"],
+                offline=gate["test"]).save(save_dir)
     return gate
 
 
@@ -190,6 +212,8 @@ def main(argv=None) -> None:
     for task, t in report["tasks"].items():
         if "gate" in t:
             print(format_curve(task, t["gate"]), file=sys.stderr)
+        for w in t.get("warnings", []):
+            print(f"[{task}] WARNING: {w}", file=sys.stderr)
     json.dump(report, sys.stdout, indent=2)
     print()
 

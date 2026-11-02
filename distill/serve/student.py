@@ -25,6 +25,7 @@ class Student:
     expected_agreement: float | None  # offline teacher agreement on the rows the gate accepts
     meta: dict = field(default_factory=dict)  # features, model id, l2, init: how to rebuild the extractor
     expected_fallback_agreement: float | None = None  # offline: student's guess vs teacher on rejected rows
+    offline: dict | None = None  # gate metrics on the held-out test slice: what serving should reproduce (M3)
     directory: Path | None = field(default=None, compare=False)  # set on load: where named files (an adapter) live
 
     def probs(self, X: np.ndarray) -> np.ndarray:
@@ -38,7 +39,7 @@ class Student:
             "task": self.task, "question": self.question, "classes": self.classes,
             "temperature": self.temperature, "tau": self.tau, "reference_counts": self.reference_counts,
             "expected_agreement": self.expected_agreement, "meta": self.meta,
-            "expected_fallback_agreement": self.expected_fallback_agreement}, indent=2))
+            "expected_fallback_agreement": self.expected_fallback_agreement, "offline": self.offline}, indent=2))
         return stem.with_suffix(".json")
 
     @classmethod
@@ -49,7 +50,7 @@ class Student:
         head.mean, head.std, head.W = arrays["mean"], arrays["std"], arrays["W"]
         return cls(meta["task"], meta["question"], meta["classes"], head, meta["temperature"], meta["tau"],
                    meta["reference_counts"], meta["expected_agreement"], meta["meta"],
-                   meta.get("expected_fallback_agreement"), Path(path).parent)
+                   meta.get("expected_fallback_agreement"), meta.get("offline"), Path(path).parent)
 
 
 def student_stem(directory: str | Path, task: str) -> Path:

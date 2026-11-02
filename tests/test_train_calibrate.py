@@ -73,6 +73,22 @@ def test_baseline_adds_zero_shot_row_when_extractor_has_one(write_jsonl):
     assert set(zs) == {"accuracy_vs_teacher", "accuracy_vs_human", "temperature", "ece_before", "ece_after"}
     assert zs["accuracy_vs_teacher"] < 0.5 < t["accuracy_vs_teacher"]  # constant guess ≈ 1/3; the head learns
     assert zs["ece_after"] < zs["ece_before"]  # scaling tames the overconfident constant
+    assert t["warnings"] == []  # a constant guess is worse than teacher and student: nothing to warn about
+
+
+def test_warns_when_teacher_or_student_is_worse_than_zero_shot():
+    from distill.train.baseline import worse_than_zero_shot
+
+    rng = np.random.default_rng(0)
+    human = rng.integers(3, size=100)
+    zero_shot = np.where(rng.random(100) < 0.85, human, (human + 1) % 3)
+    biased = np.where(rng.random(100) < 0.65, human, (human + 2) % 3)  # a teacher 20 points worse
+    w = worse_than_zero_shot(zero_shot, biased, biased, human)
+    assert len(w) == 2 and w[0].startswith("teacher") and w[1].startswith("student")
+    assert worse_than_zero_shot(zero_shot, human, zero_shot, human) == []  # better or equal: no warning
+    close = np.where(np.arange(100) < 3, (human + 1) % 3, zero_shot)  # 3 rows worse: inside the noise
+    assert worse_than_zero_shot(zero_shot, close, close, human) == []
+    assert worse_than_zero_shot(zero_shot, biased, biased, np.full(100, -1)) == []  # no human labels
 
 
 def test_calibration_chooses_between_prior_and_zero_init(write_jsonl):
