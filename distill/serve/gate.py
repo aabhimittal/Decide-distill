@@ -65,10 +65,12 @@ def gate_metrics(conf: np.ndarray, pred: np.ndarray, teacher: np.ndarray, tau: f
         # the student's own guess vs the teacher on rows it handed over: the baseline the fallback monitor uses
         "rejected_agreement": float((pred[~accept] == teacher[~accept]).mean()) if (~accept).any() else None,
         "system_agreement": float((answer == teacher).mean()),
+        "n": int(len(conf)), "n_accepted": int(accept.sum()),  # sample sizes, for tolerance bands
     }
     if human is not None and (human >= 0).any():
         m = human >= 0
         out["system_accuracy_vs_human"] = float((answer[m] == human[m]).mean())
+        out["n_human"] = int(m.sum())
     if teacher_cost is not None:
         out["cost_per_1k_teacher_only"] = 1000 * teacher_cost
         out["cost_per_1k_gated"] = 1000 * teacher_cost * out["fallback_rate"]  # local student cost not counted

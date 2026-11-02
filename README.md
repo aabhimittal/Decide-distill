@@ -102,7 +102,16 @@ is never queued.
 
 `python -m distill.serve.replay students/ new_logs.jsonl` sends logged rows through the same gate, one at a
 time, with the logged label as the teacher: the check that served fallback rate and agreement match the
-offline estimate.
+offline estimate. Each saved student carries its test-slice gate metrics with their sample sizes, and
+`acceptance` in the replay report gives each metric (fallback rate, agreement on accepted rows, accuracy
+vs human) a tolerance of 2 two-sample standard errors. The command exits 1 if any metric is outside it.
+Both sides are small samples, so on 120 test rows the band is wide (about ±5 points for fallback, ±8 for
+accuracy): it catches a broken gate or real drift, not a 2-point slip.
+
+When the extractor has a zero-shot readout (d1), `baseline` also runs a paired sign test on test rows that
+have human labels. It warns (`warnings` in the report, `WARNING` on stderr) when the teacher, or the student
+it taught, is significantly less accurate than untrained d1. Random teacher noise averages out in training;
+a biased teacher is copied, and the gate can't help, since every fallback goes to that same teacher.
 
 **`/dashboard`** (SPEC v1 cost dashboard) shows per task: requests, fallback rate, teacher calls, cost per
 1k decisions gated vs teacher-only and the saving, PSI, both agreement streams, and alarms; it refreshes

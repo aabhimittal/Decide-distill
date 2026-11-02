@@ -123,6 +123,26 @@ def test_replay_through_the_served_gate_matches_the_offline_estimate(students):
     got = replay(students, HashingFeatures(), test_rows)["ticket_team"]
     for key in ("fallback_rate", "accepted_agreement", "system_agreement", "system_accuracy_vs_human", "tau"):
         assert got[key] == pytest.approx(report["gate"]["test"][key]), key
+    assert got["acceptance"]["within_tolerance"]  # the identical slice is trivially within it
+
+
+def test_replay_acceptance_passes_fresh_traffic_and_fails_a_broken_gate(students, write_jsonl, tmp_path):
+    from distill.serve.replay import acceptance, main
+
+    students, _ = students
+    fresh = [parse(r) for r in make_logs(300, start=7000, seed=9)]  # same distribution, new rows
+    got = replay(students, HashingFeatures(), fresh)["ticket_team"]["acceptance"]
+    assert got["within_tolerance"] and set(got) >= {"fallback_rate", "accepted_agreement"}
+
+    s = students["ticket_team"]
+    s.tau = math.inf  # a gate that sends everything back: fallback 100% against an offline estimate far lower
+    bad = replay(students, HashingFeatures(), fresh)["ticket_team"]["acceptance"]
+    assert not bad["fallback_rate"]["ok"] and not bad["within_tolerance"]
+    assert acceptance(None, {"fallback_rate": 0.5, "n": 10}) is None  # students saved before offline estimates
+
+    s.save(tmp_path / "broken")
+    with pytest.raises(SystemExit, match="outside the offline tolerance"):
+        main([str(tmp_path / "broken"), str(write_jsonl(make_logs(300, start=7000, seed=9), "fresh.jsonl"))])
 
 
 def test_http_app(students):
